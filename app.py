@@ -376,21 +376,26 @@ def _values_to_df(values):
 
 
 @st.cache_data(ttl=REFRESH_TTL, show_spinner=False)
-def read_sheet(sheet_id, sa_json_key):
-    """Returns dict: configured, error, cconma, fba, sales, master (DataFrames)."""
+def read_sheet(sheet_id, _auth_key):
     out = {"configured": False, "error": None,
            "cconma": pd.DataFrame(), "fba": pd.DataFrame(),
            "sales": pd.DataFrame(), "master": pd.DataFrame(), "detected": {}}
     if not sheet_id:
         out["error"] = "GOOGLE_SHEET_ID 미설정"
         return out
-    creds, err = _credentials()
-    if err:
-        out["error"] = err
-        return out
+
+    api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
     try:
         from googleapiclient.discovery import build
-        svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+        if api_key:
+            svc = build("sheets", "v4", developerKey=api_key, cache_discovery=False)
+        else:
+            creds, err = _credentials()
+            if err:
+                out["error"] = err
+                return out
+            svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+
         meta = svc.spreadsheets().get(spreadsheetId=sheet_id, fields="sheets.properties.title").execute()
         titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
 
@@ -695,7 +700,7 @@ def keyword_revenue(master, sales, brand_kw, name_kw):
 
 # ============================ DATA ORCHESTRATION ============================
 def get_state():
-    sheet = read_sheet(SHEET_ID, SA_JSON[:24])  # key by prefix to keep cache stable
+    sheet = read_sheet(SHEET_ID, os.environ.get("GOOGLE_API_KEY", "") or SA_JSON[:24])
     # master: sheet PRODUCT INFO -> else seed
     if not sheet["master"].empty:
         master = _master_from_df(sheet["master"])
