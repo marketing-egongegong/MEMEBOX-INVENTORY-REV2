@@ -82,6 +82,7 @@ COL = {
     "brand": ["brand name", "brand", "브랜드"],
     "price": ["price", "unit price", "단가", "discount price"],
     "qty": ["available", "fulfillable", "quantity", "qty", "units", "unit", "재고", "재고수량", "수량", "stock", "onhand", "가용재고"],
+    "cconma": ["cconma", "cconma inventory", "cconma재고", "cconma 재고", "씨씨온마"],
     "s7": ["units shipped t7", "7 day", "7day", "7d", "last 7", "7일", "t7"],
     "s30": ["units shipped t30", "30 day", "30day", "30d", "last 30", "30일", "t30"],
     "date": ["date", "날짜", "일자", "order date", "purchase-date", "주문일"],
@@ -268,9 +269,19 @@ def clean_sku(v):
     return s
 
 
-def fmt(n):
+def ifloor(n):
+    """Truncate to integer (floor), never round. 15.8 -> 15."""
     try:
-        return f"{round(float(n)):,}"
+        import math
+        return int(math.floor(float(n)))
+    except (ValueError, TypeError):
+        return 0
+
+
+def fmt(n):
+    # All inventory/unit quantities display as floored integers.
+    try:
+        return f"{ifloor(n):,}"
     except (ValueError, TypeError):
         return "0"
 
@@ -376,26 +387,21 @@ def _values_to_df(values):
 
 
 @st.cache_data(ttl=REFRESH_TTL, show_spinner=False)
-def read_sheet(sheet_id, _auth_key):
+def read_sheet(sheet_id, sa_json_key):
+    """Returns dict: configured, error, cconma, fba, sales, master (DataFrames)."""
     out = {"configured": False, "error": None,
            "cconma": pd.DataFrame(), "fba": pd.DataFrame(),
            "sales": pd.DataFrame(), "master": pd.DataFrame(), "detected": {}}
     if not sheet_id:
         out["error"] = "GOOGLE_SHEET_ID 미설정"
         return out
-
-    api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+    creds, err = _credentials()
+    if err:
+        out["error"] = err
+        return out
     try:
         from googleapiclient.discovery import build
-        if api_key:
-            svc = build("sheets", "v4", developerKey=api_key, cache_discovery=False)
-        else:
-            creds, err = _credentials()
-            if err:
-                out["error"] = err
-                return out
-            svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
-
+        svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
         meta = svc.spreadsheets().get(spreadsheetId=sheet_id, fields="sheets.properties.title").execute()
         titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
 
@@ -430,12 +436,13 @@ def read_sheet(sheet_id, _auth_key):
 
 
 # ============================ INDEX SOURCES ============================
-def index_inv(df):
-    """sku -> qty"""
+def index_inv(df, qty_cands=None):
+    """sku -> qty. qty_cands lets the caller force a specific column (e.g. 'CCONMA')."""
     res = {}
     if df is None or df.empty:
         return res
-    ks, kq = pick(df, COL["sku"]), pick(df, COL["qty"])
+    ks = pick(df, COL["sku"])
+    kq = pick(df, qty_cands if qty_cands else COL["qty"])
     if not ks:
         return res
     for _, r in df.iterrows():
@@ -562,22 +569,38 @@ def build_dataframes(master, cc_map, fba_map, asales, tcc_map, tfbt_map, tsales)
         sku = p["SKU"]
         cc = cc_map.get(sku, 0.0)
         fb = fba_map.get(sku, {c: 0.0 for c in FBA_SUBCOLS})
-        fba_total = sum(fb.get(c, 0.0) for c in FBA_SUBCOLS)
+
+        fba_available = ifloor(fb.get("FBA_Available", 0.0))
+        fba_inbound = ifloor(fb.get("FBA_inbound_working", 0.0)
+                             + fb.get("FBA_inbound_shipped", 0.0)
+                             + fb.get("FBA_inbound_receiving", 0.0))
+        fba_reserved = ifloor(fb.get("FBA_reserved_processing", 0.0)
+                              + fb.get("FBA_reserved_transfer", 0.0))
+        fba_reserved_orders = ifloor(fb.get("FBA_reserved_orders", 0.0))
+        # Total FBA = Available + Inbound + Reserved(processing+transfer); Reserved Orders EXCLUDED.
+        total_fba = fba_available + fba_inbound + fba_reserved
+        cc_i = ifloor(cc)
+        # Total Inventory = CCONMA + Total FBA  (sums of the displayed integers)
+        total = cc_i + total_fba
+
         sp = asales.get(sku, {"s7": 0.0, "s30": 0.0, "daily": {}})
         s7, s30 = sp["s7"], sp["s30"]
         da = s30 / 30.0
-        total = cc + fba_total
         cov = (total / da) if da > 0 else (999 if total > 0 else 0)
-        fba_cov = (fba_total / da) if da > 0 else (999 if fba_total > 0 else 0)
+        fba_cov = (total_fba / da) if da > 0 else (999 if total_fba > 0 else 0)
         st_ = status_of(cov)
-        if cc or fba_total or s30 or s7:
+        if cc_i or total_fba or fba_reserved_orders or s30 or s7:
             row = {"SKU": sku, "ASIN": p["ASIN"], "Product Name": p["Product Name"],
-                   "Brand": p["Brand"], "CCONMA": cc}
-            for c in FBA_SUBCOLS:
-                row[c] = fb.get(c, 0.0)
-            row.update({"FBA_Total": fba_total, "Total": total,
-                        "7D": s7, "30D": s30, "DailyAvg": round(da, 2),
-                        "CoverageDays": round(cov) if cov < 999 else 999, "Status": st_})
+                   "Brand": p["Brand"],
+                   "CCONMA Inventory": cc_i,
+                   "FBA Available": fba_available,
+                   "FBA Inbound": fba_inbound,
+                   "FBA Reserved": fba_reserved,
+                   "FBA Reserved Orders": fba_reserved_orders,
+                   "Total FBA Inventory": total_fba,
+                   "Total Inventory": total,
+                   "CoverageDays": round(cov) if cov < 999 else 999, "Status": st_,
+                   "7D": ifloor(s7), "30D": ifloor(s30), "DailyAvg": round(da, 2)}
             amazon_rows.append(row)
             if cov < PO_THRESHOLD:
                 rec = max(0, round(da * PO_TARGET_DAYS - total))
@@ -585,13 +608,13 @@ def build_dataframes(master, cc_map, fba_map, asales, tcc_map, tfbt_map, tsales)
                 po_rows.append({"SKU": sku, "Product Name": p["Product Name"], "Brand": p["Brand"],
                                 "Current Inventory": total, "DailyAvg": round(da, 2),
                                 "CoverageDays": round(cov) if cov < 999 else 999,
-                                "Recommended Order Qty": rec, "발주 후 회전일": cov_after})
-            if fba_cov < TR_FBA_DAYS and cc > 0:
-                rec = max(0, min(cc, round(da * TR_TARGET_DAYS - fba_total)))
+                                "Recommended Order Qty": ifloor(rec), "발주 후 회전일": cov_after})
+            if fba_cov < TR_FBA_DAYS and cc_i > 0:
+                rec = max(0, min(cc_i, round(da * TR_TARGET_DAYS - total_fba)))
                 if rec > 0:
                     tr_rows.append({"SKU": sku, "Product Name": p["Product Name"], "Brand": p["Brand"],
-                                    "FBA Inventory": fba_total, "CCONMA Inventory": cc,
-                                    "Recommended Transfer Qty": rec})
+                                    "FBA Inventory": total_fba, "CCONMA Inventory": cc_i,
+                                    "Recommended Transfer Qty": ifloor(rec)})
         # TikTok
         tcc = tcc_map.get(sku, 0.0)
         tfbt = tfbt_map.get(sku, 0.0)
@@ -602,8 +625,8 @@ def build_dataframes(master, cc_map, fba_map, asales, tcc_map, tfbt_map, tsales)
         tcov = (ttotal / tda) if tda > 0 else (999 if ttotal > 0 else 0)
         if tcc or tfbt or t30 or t7:
             tiktok_rows.append({"SKU": sku, "Product Name": p["Product Name"], "Brand": p["Brand"],
-                                "CCONMA": tcc, "FBT": tfbt, "Total": ttotal,
-                                "7D": t7, "30D": t30, "DailyAvg": round(tda, 2),
+                                "CCONMA": ifloor(tcc), "FBT": ifloor(tfbt), "Total": ifloor(ttotal),
+                                "7D": ifloor(t7), "30D": ifloor(t30), "DailyAvg": round(tda, 2),
                                 "CoverageDays": round(tcov) if tcov < 999 else 999, "Status": status_of(tcov)})
     amazon = pd.DataFrame(amazon_rows)
     tiktok = pd.DataFrame(tiktok_rows)
@@ -700,7 +723,7 @@ def keyword_revenue(master, sales, brand_kw, name_kw):
 
 # ============================ DATA ORCHESTRATION ============================
 def get_state():
-    sheet = read_sheet(SHEET_ID, os.environ.get("GOOGLE_API_KEY", "") or SA_JSON[:24])
+    sheet = read_sheet(SHEET_ID, SA_JSON[:24])  # key by prefix to keep cache stable
     # master: sheet PRODUCT INFO -> else seed
     if not sheet["master"].empty:
         master = _master_from_df(sheet["master"])
@@ -715,7 +738,7 @@ def get_state():
     up_tsales = st.session_state.get("up_tsales")
 
     # CCONMA (shared warehouse tab) — used by BOTH Amazon and TikTok
-    cc_map = index_inv(sheet["cconma"]) if not sheet["cconma"].empty else (demo["cc"] if demo else {})
+    cc_map = index_inv(sheet["cconma"], COL["cconma"] + COL["qty"]) if not sheet["cconma"].empty else (demo["cc"] if demo else {})
     # Amazon FBA sub-columns
     fba_map = index_fba(sheet["fba"]) if not sheet["fba"].empty else (demo["fba"] if demo else {})
     # Amazon sales
@@ -832,7 +855,21 @@ def page_home(S, brand):
 
 def page_amazon_inventory(S, brand):
     st.title("Amazon Inventory")
-    st.caption("CCONMA + FBA(세부 컬럼 분리) · Coverage / Status")
+    st.caption("CCONMA + FBA(Available / Inbound / Reserved 분리) · Coverage / Status")
+
+    df = apply_filters(S["amazon"], brand, st.session_state.get("query", ""), use_status=False)
+
+    # ---- 상단 KPI (정수/절삭, 브랜드 필터 적용) ----
+    def col_sum(name):
+        return df[name].sum() if (df is not None and not df.empty and name in df.columns) else 0
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Available Inventory", fmt(col_sum("FBA Available")))
+    k2.metric("Inbound Inventory", fmt(col_sum("FBA Inbound")))
+    k3.metric("Reserved Inventory", fmt(col_sum("FBA Reserved")))
+    k4.metric("Total FBA Inventory", fmt(col_sum("Total FBA Inventory")))
+    k5.metric("Total CCONMA Inventory", fmt(col_sum("CCONMA Inventory")))
+    k6.metric("Total Inventory", fmt(col_sum("Total Inventory")))
+
     f1, f2 = st.columns(2)
     st.session_state["f_status"] = f1.selectbox("Status", ["전체", "Critical", "Warning", "Healthy"],
                                                 index=["전체", "Critical", "Warning", "Healthy"].index(st.session_state.get("f_status", "전체")))
@@ -840,10 +877,17 @@ def page_amazon_inventory(S, brand):
                                              index=["전체", "< 30일", "30–60일", "> 60일"].index(st.session_state.get("f_cov", "전체")))
     df = apply_filters(S["amazon"], brand, st.session_state.get("query", ""), use_status=True)
     st.caption(f"{len(df)} / {len(S['amazon'])} SKU")
-    cols_order = ["SKU", "ASIN", "Product Name", "Brand", "CCONMA"] + FBA_SUBCOLS + \
-                 ["FBA_Total", "Total", "7D", "30D", "DailyAvg", "CoverageDays", "Status"]
+    cols_order = ["SKU", "ASIN", "Product Name", "Brand", "CCONMA Inventory",
+                  "FBA Available", "FBA Inbound", "FBA Reserved", "FBA Reserved Orders",
+                  "Total FBA Inventory", "Total Inventory", "CoverageDays", "Status"]
+    qty_cols = ["CCONMA Inventory", "FBA Available", "FBA Inbound", "FBA Reserved",
+                "FBA Reserved Orders", "Total FBA Inventory", "Total Inventory"]
     if not df.empty:
-        df = df[[c for c in cols_order if c in df.columns]]
+        df = df[[c for c in cols_order if c in df.columns]].copy()
+        for c in qty_cols:
+            if c in df.columns:
+                df[c] = df[c].apply(ifloor)
+        df = df.rename(columns={"CoverageDays": "Coverage Days"})
         st.dataframe(style_status(df), use_container_width=True, height=560)
         download_btn(df, "⬇ CSV Export", f"amazon_inventory_{brand or 'all'}.csv")
     else:
