@@ -83,6 +83,7 @@ COL = {
     "price": ["price", "unit price", "단가", "discount price"],
     "qty": ["available", "fulfillable", "quantity", "qty", "units", "unit", "재고", "재고수량", "수량", "stock", "onhand", "가용재고"],
     "cconma": ["cconma", "cconma inventory", "cconma재고", "cconma 재고", "씨씨온마"],
+    "internal": ["internal code", "internalcode", "internal", "internal sku", "internal-code", "내부코드", "관리코드", "사내코드", "internal_code", "내부 코드"],
     "s7": ["units shipped t7", "7 day", "7day", "7d", "last 7", "7일", "t7"],
     "s30": ["units shipped t30", "30 day", "30day", "30d", "last 30", "30일", "t30"],
     "date": ["date", "날짜", "일자", "order date", "purchase-date", "주문일"],
@@ -337,6 +338,7 @@ def load_master_from_csv(csv_text):
 def _master_from_df(df):
     ks, kn = pick(df, COL["sku"]), pick(df, COL["name"])
     ka, kb, kp = pick(df, COL["asin"]), pick(df, COL["brand"]), pick(df, COL["price"])
+    kic = pick(df, COL["internal"])
     rows = []
     for _, r in df.iterrows():
         if not ks:
@@ -347,6 +349,7 @@ def _master_from_df(df):
         sku = clean_sku(raw)
         rows.append({
             "SKU": sku,
+            "Internal Code": str(r[kic]).strip() if kic else "",
             "ASIN": str(r[ka]).strip() if ka else "",
             "Product Name": str(r[kn]).strip() if kn else sku,
             "Brand": str(r[kb]).strip() if kb else "",
@@ -388,56 +391,56 @@ def _values_to_df(values):
 
 @st.cache_data(ttl=REFRESH_TTL, show_spinner=False)
 def read_sheet(sheet_id, _auth_key):
-    out = {"configured": False, "error": None,
-           "cconma": pd.DataFrame(), "fba": pd.DataFrame(),
-           "sales": pd.DataFrame(), "master": pd.DataFrame(), "detected": {}}
-    if not sheet_id:
-        out["error"] = "GOOGLE_SHEET_ID 미설정"
-        return out
+    out = {"configured": False, "error": None,
+           "cconma": pd.DataFrame(), "fba": pd.DataFrame(),
+           "sales": pd.DataFrame(), "master": pd.DataFrame(), "detected": {}}
+    if not sheet_id:
+        out["error"] = "GOOGLE_SHEET_ID 미설정"
+        return out
 
-    api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
-    try:
-        from googleapiclient.discovery import build
-        if api_key:
-            svc = build("sheets", "v4", developerKey=api_key, cache_discovery=False)
-        else:
-            creds, err = _credentials()
-            if err:
-                out["error"] = err
-                return out
-            svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+    try:
+        from googleapiclient.discovery import build
+        if api_key:
+            svc = build("sheets", "v4", developerKey=api_key, cache_discovery=False)
+        else:
+            creds, err = _credentials()
+            if err:
+                out["error"] = err
+                return out
+            svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
 
-        meta = svc.spreadsheets().get(spreadsheetId=sheet_id, fields="sheets.properties.title").execute()
-        titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+        meta = svc.spreadsheets().get(spreadsheetId=sheet_id, fields="sheets.properties.title").execute()
+        titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
 
-        def has(t, *keys):
-            tn = norm(t)
-            return any(norm(k) in tn for k in keys)
+        def has(t, *keys):
+            tn = norm(t)
+            return any(norm(k) in tn for k in keys)
 
-        role = {}
-        for t in titles:
-            if "cconma" not in role and has(t, "cconma"):
-                role["cconma"] = t
-            elif "fba" not in role and has(t, "fba"):
-                role["fba"] = t
-            elif "sales" not in role and (has(t, "일별") or has(t, "saleshist") or has(t, "dailysales")):
-                role["sales"] = t
-            elif "master" not in role and (has(t, "productinfo") or has(t, "master") or has(t, "마스터")):
-                role["master"] = t
-        out["detected"] = role
-        if role:
-            resp = svc.spreadsheets().values().batchGet(
-                spreadsheetId=sheet_id,
-                ranges=[f"'{t}'" for t in role.values()],
-                valueRenderOption="UNFORMATTED_VALUE").execute()
-            ranges = resp.get("valueRanges", [])
-            for i, key in enumerate(role.keys()):
-                vals = ranges[i].get("values", []) if i < len(ranges) else []
-                out[key] = _values_to_df(vals)
-        out["configured"] = True
-    except Exception as e:  # noqa: BLE001
-        out["error"] = f"시트 읽기 실패: {e}"
-    return out
+        role = {}
+        for t in titles:
+            if "cconma" not in role and has(t, "cconma"):
+                role["cconma"] = t
+            elif "fba" not in role and has(t, "fba"):
+                role["fba"] = t
+            elif "sales" not in role and (has(t, "일별") or has(t, "saleshist") or has(t, "dailysales")):
+                role["sales"] = t
+            elif "master" not in role and (has(t, "productinfo") or has(t, "master") or has(t, "마스터")):
+                role["master"] = t
+        out["detected"] = role
+        if role:
+            resp = svc.spreadsheets().values().batchGet(
+                spreadsheetId=sheet_id,
+                ranges=[f"'{t}'" for t in role.values()],
+                valueRenderOption="UNFORMATTED_VALUE").execute()
+            ranges = resp.get("valueRanges", [])
+            for i, key in enumerate(role.keys()):
+                vals = ranges[i].get("values", []) if i < len(ranges) else []
+                out[key] = _values_to_df(vals)
+        out["configured"] = True
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"시트 읽기 실패: {e}"
+    return out
 
 
 # ============================ INDEX SOURCES ============================
@@ -458,24 +461,85 @@ def index_inv(df, qty_cands=None):
     return res
 
 
-def index_fba(df):
-    """sku -> {sub-col: qty}"""
-    res = {}
+def _row_keys(r, ks, ki, ka):
+    internal = clean_sku(r[ki]) if ki else ""
+    sku = clean_sku(r[ks]) if ks else ""
+    asin = str(r[ka]).strip() if ka else ""
+    return internal, sku, asin
+
+
+def find_cconma_col(df):
+    """1) exact name 'CCONMA'  2) name contains 'CCONMA'  3) M column (index 12)."""
+    cols = list(df.columns)
+    for c in cols:
+        if norm(c) == "cconma":
+            return c, "이름 정확 일치 ('CCONMA')"
+    for c in cols:
+        if "cconma" in norm(c):
+            return c, f"이름 포함 ('{c}')"
+    if len(cols) >= 13:
+        return cols[12], f"M열 사용 ('{cols[12]}')"
+    return None, "해당 컬럼 없음"
+
+
+def index_cconma(df):
+    """Keyed CCONMA index: by internal/sku/asin -> qty, plus validation metadata."""
+    info = {"columns": [], "n_rows": 0, "col": None, "col_method": "해당 컬럼 없음",
+            "total_qty": 0.0, "by_internal": {}, "by_sku": {}, "by_asin": {}, "rows": []}
     if df is None or df.empty:
-        return res
-    ks = pick(df, COL["sku"])
-    if not ks:
-        return res
+        return info
+    info["columns"] = [str(c) for c in df.columns]
+    info["n_rows"] = int(len(df))
+    col, method = find_cconma_col(df)
+    info["col"], info["col_method"] = col, method
+    ks, ki, ka = pick(df, COL["sku"]), pick(df, COL["internal"]), pick(df, COL["asin"])
+    kb, kn = pick(df, COL["brand"]), pick(df, COL["name"])
+    for _, r in df.iterrows():
+        internal, sku, asin = _row_keys(r, ks, ki, ka)
+        qty = numv(r[col]) if col else 0.0
+        info["total_qty"] += qty
+        if internal:
+            info["by_internal"][internal] = info["by_internal"].get(internal, 0.0) + qty
+        if sku:
+            info["by_sku"][sku] = info["by_sku"].get(sku, 0.0) + qty
+        if asin:
+            info["by_asin"][asin] = info["by_asin"].get(asin, 0.0) + qty
+        info["rows"].append({"internal": internal, "sku": sku, "asin": asin, "qty": qty,
+                             "brand": str(r[kb]).strip() if kb else "",
+                             "name": str(r[kn]).strip() if kn else ""})
+    return info
+
+
+def index_fba(df):
+    """Keyed FBA index: by internal/sku/asin -> {sub-col: qty}."""
+    info = {"columns": [], "n_rows": 0, "by_internal": {}, "by_sku": {}, "by_asin": {}}
+    if df is None or df.empty:
+        return info
+    info["columns"] = [str(c) for c in df.columns]
+    info["n_rows"] = int(len(df))
+    ks, ki, ka = pick(df, COL["sku"]), pick(df, COL["internal"]), pick(df, COL["asin"])
     found = {k: pick(df, v) for k, v in FBA_MATCH.items()}
     for _, r in df.iterrows():
-        sku = clean_sku(r[ks])
-        if not sku:
-            continue
-        d = res.setdefault(sku, {c: 0.0 for c in FBA_SUBCOLS})
-        for sub, col in found.items():
-            if col:
-                d[sub] += numv(r[col])
-    return res
+        internal, sku, asin = _row_keys(r, ks, ki, ka)
+        sub = {c: (numv(r[found[c]]) if found[c] else 0.0) for c in FBA_SUBCOLS}
+        for key, store in [(internal, "by_internal"), (sku, "by_sku"), (asin, "by_asin")]:
+            if not key:
+                continue
+            d = info[store].setdefault(key, {c: 0.0 for c in FBA_SUBCOLS})
+            for c in FBA_SUBCOLS:
+                d[c] += sub[c]
+    return info
+
+
+def resolve(idx, internal, sku, asin, default):
+    """Match priority: Internal Code -> SKU (SAP CODE) -> ASIN. Returns (value, matched_key)."""
+    if internal and internal in idx.get("by_internal", {}):
+        return idx["by_internal"][internal], "Internal Code"
+    if sku and sku in idx.get("by_sku", {}):
+        return idx["by_sku"][sku], "SKU"
+    if asin and asin in idx.get("by_asin", {}):
+        return idx["by_asin"][asin], "ASIN"
+    return default, None
 
 
 def index_sales(df):
@@ -568,12 +632,16 @@ def gen_demo(master):
 
 
 # ============================ COMPUTE ============================
-def build_dataframes(master, cc_map, fba_map, asales, tcc_map, tfbt_map, tsales):
+def build_dataframes(master, cc_idx, fba_idx, asales, tfbt_map, tsales):
     amazon_rows, tiktok_rows, po_rows, tr_rows = [], [], [], []
+    zero_fba = {c: 0.0 for c in FBA_SUBCOLS}
     for _, p in master.iterrows():
-        sku = p["SKU"]
-        cc = cc_map.get(sku, 0.0)
-        fb = fba_map.get(sku, {c: 0.0 for c in FBA_SUBCOLS})
+        sku = clean_sku(p["SKU"])
+        internal = clean_sku(p.get("Internal Code", "")) if "Internal Code" in master.columns else ""
+        asin = str(p.get("ASIN", "")).strip()
+        # Match priority: Internal Code -> SKU (SAP CODE) -> ASIN
+        cc, _cc_key = resolve(cc_idx, internal, sku, asin, 0.0)
+        fb, _fb_key = resolve(fba_idx, internal, sku, asin, zero_fba)
 
         fba_available = ifloor(fb.get("FBA_Available", 0.0))
         fba_inbound = ifloor(fb.get("FBA_inbound_working", 0.0)
@@ -595,7 +663,8 @@ def build_dataframes(master, cc_map, fba_map, asales, tcc_map, tfbt_map, tsales)
         fba_cov = (total_fba / da) if da > 0 else (999 if total_fba > 0 else 0)
         st_ = status_of(cov)
         if cc_i or total_fba or fba_reserved_orders or s30 or s7:
-            row = {"SKU": sku, "ASIN": p["ASIN"], "Product Name": p["Product Name"],
+            row = {"SKU": sku, "Internal Code": p.get("Internal Code", "") if "Internal Code" in master.columns else "",
+                   "ASIN": p["ASIN"], "Product Name": p["Product Name"],
                    "Brand": p["Brand"],
                    "CCONMA Inventory": cc_i,
                    "FBA Available": fba_available,
@@ -620,8 +689,8 @@ def build_dataframes(master, cc_map, fba_map, asales, tcc_map, tfbt_map, tsales)
                     tr_rows.append({"SKU": sku, "Product Name": p["Product Name"], "Brand": p["Brand"],
                                     "FBA Inventory": total_fba, "CCONMA Inventory": cc_i,
                                     "Recommended Transfer Qty": ifloor(rec)})
-        # TikTok
-        tcc = tcc_map.get(sku, 0.0)
+        # TikTok — CCONMA from the same 재고 시트_CCONMA (resolved above)
+        tcc = cc_i
         tfbt = tfbt_map.get(sku, 0.0)
         tsp = tsales.get(sku, {"s7": 0.0, "s30": 0.0, "daily": {}})
         t7, t30 = tsp["s7"], tsp["s30"]
@@ -742,21 +811,69 @@ def get_state():
     up_fbt = st.session_state.get("up_fbt")
     up_tsales = st.session_state.get("up_tsales")
 
-    # CCONMA (shared warehouse tab) — used by BOTH Amazon and TikTok
-    cc_map = index_inv(sheet["cconma"], COL["cconma"] + COL["qty"]) if not sheet["cconma"].empty else (demo["cc"] if demo else {})
-    # Amazon FBA sub-columns
-    fba_map = index_fba(sheet["fba"]) if not sheet["fba"].empty else (demo["fba"] if demo else {})
-    # Amazon sales
+    # ---- CCONMA: keyed index (Internal Code -> SKU -> ASIN) ----
+    if not sheet["cconma"].empty:
+        cc_idx = index_cconma(sheet["cconma"])
+    elif demo:
+        cc_idx = {"columns": ["SKU", "CCONMA"], "n_rows": len(demo["cc"]),
+                  "col": "CCONMA (demo)", "col_method": "데모 데이터",
+                  "total_qty": float(sum(demo["cc"].values())),
+                  "by_internal": {}, "by_sku": dict(demo["cc"]), "by_asin": {},
+                  "rows": [{"internal": "", "sku": k, "asin": "", "qty": v, "brand": "", "name": ""} for k, v in demo["cc"].items()]}
+    else:
+        cc_idx = index_cconma(pd.DataFrame())
+
+    # ---- FBA: keyed index ----
+    if not sheet["fba"].empty:
+        fba_idx = index_fba(sheet["fba"])
+    elif demo:
+        fba_idx = {"columns": list(FBA_SUBCOLS), "n_rows": len(demo["fba"]),
+                   "by_internal": {}, "by_sku": dict(demo["fba"]), "by_asin": {}}
+    else:
+        fba_idx = index_fba(pd.DataFrame())
+
     asales = index_sales(sheet["sales"]) if not sheet["sales"].empty else (demo["asales"] if demo else {})
 
-    # TikTok CCONMA = same CCONMA tab; FBT + sales from upload (else demo)
-    tcc_map = cc_map
+    up_fbt = st.session_state.get("up_fbt")
+    up_tsales = st.session_state.get("up_tsales")
     tfbt_map = index_inv(up_fbt) if up_fbt is not None else (demo["tfbt"] if demo else {})
     tsales = index_sales(up_tsales) if up_tsales is not None else (demo["tsales"] if demo else {})
 
-    amazon, tiktok, po, tr = build_dataframes(master, cc_map, fba_map, asales, tcc_map, tfbt_map, tsales)
+    amazon, tiktok, po, tr = build_dataframes(master, cc_idx, fba_idx, asales, tfbt_map, tsales)
+    validation = compute_validation(master, cc_idx, sheet)
     return {"sheet": sheet, "master": master, "amazon": amazon, "tiktok": tiktok,
-            "po": po, "tr": tr, "asales": asales, "tsales": tsales}
+            "po": po, "tr": tr, "asales": asales, "tsales": tsales,
+            "cc_idx": cc_idx, "fba_idx": fba_idx, "validation": validation}
+
+
+def compute_validation(master, cc_idx, sheet):
+    """Build the Data Validation summary + failed-match table for CCONMA."""
+    m_int = set(x for x in master["Internal Code"].tolist() if x) if "Internal Code" in master.columns else set()
+    m_int = set(clean_sku(x) for x in m_int if str(x).strip())
+    m_sku = set(clean_sku(x) for x in master["SKU"].tolist() if str(x).strip())
+    m_asin = set(str(x).strip() for x in master["ASIN"].tolist() if str(x).strip())
+    matched, failed_rows = 0, []
+    for r in cc_idx.get("rows", []):
+        hit = (r["internal"] and r["internal"] in m_int) or (r["sku"] and r["sku"] in m_sku) or (r["asin"] and r["asin"] in m_asin)
+        if hit:
+            matched += 1
+        else:
+            if r["qty"] or r["sku"] or r["internal"]:
+                reason = []
+                if not r["internal"]:
+                    reason.append("Internal 없음")
+                elif r["internal"] not in m_int:
+                    reason.append("Internal 불일치")
+                if r["sku"] and r["sku"] not in m_sku:
+                    reason.append("SKU 불일치")
+                if r["asin"] and r["asin"] not in m_asin:
+                    reason.append("ASIN 불일치")
+                failed_rows.append({"Brand": r["brand"], "Internal Code": r["internal"],
+                                    "SKU": r["sku"], "Product Name": r["name"],
+                                    "CCONMA Qty": ifloor(r["qty"]),
+                                    "매칭 실패 사유": ", ".join(reason) or "마스터 매칭 실패"})
+    return {"matched": matched, "failed": len(failed_rows),
+            "failed_rows": pd.DataFrame(failed_rows), "cc_total": ifloor(cc_idx.get("total_qty", 0))}
 
 
 def apply_filters(df, brand, query, use_status=False):
@@ -767,7 +884,7 @@ def apply_filters(df, brand, query, use_status=False):
         out = out[out["Brand"] == brand]
     if query:
         q = query.strip().lower()
-        cols = [c for c in ["SKU", "ASIN", "Product Name"] if c in out.columns]
+        cols = [c for c in ["Internal Code", "SKU", "ASIN", "Product Name"] if c in out.columns]
         mask = False
         for c in cols:
             mask = mask | out[c].astype(str).str.lower().str.contains(q, na=False)
@@ -882,8 +999,8 @@ def page_amazon_inventory(S, brand):
                                              index=["전체", "< 30일", "30–60일", "> 60일"].index(st.session_state.get("f_cov", "전체")))
     df = apply_filters(S["amazon"], brand, st.session_state.get("query", ""), use_status=True)
     st.caption(f"{len(df)} / {len(S['amazon'])} SKU")
-    cols_order = ["SKU", "ASIN", "Product Name", "Brand", "CCONMA Inventory",
-                  "FBA Available", "FBA Inbound", "FBA Reserved", "FBA Reserved Orders",
+    cols_order = ["Brand", "Internal Code", "SKU", "ASIN", "Product Name", "CCONMA Inventory",
+                  "FBA Available", "FBA Inbound", "FBA Reserved",
                   "Total FBA Inventory", "Total Inventory", "CoverageDays", "Status"]
     qty_cols = ["CCONMA Inventory", "FBA Available", "FBA Inbound", "FBA Reserved",
                 "FBA Reserved Orders", "Total FBA Inventory", "Total Inventory"]
@@ -959,6 +1076,62 @@ def kpi_row(agg):
     u4.metric("일 평균(30d)", fmt(agg["u_30"] / 30))
 
 
+def page_settings(S, brand):
+    st.title("Settings")
+    sheet = S["sheet"]
+    cc_idx = S["cc_idx"]
+    val = S["validation"]
+
+    st.subheader("Data Validation")
+    if sheet["configured"]:
+        conn = "✅ 연결됨 (Google Sheets)"
+    elif sheet["error"]:
+        conn = f"❌ 연결 안 됨 — {sheet['error']}"
+    else:
+        conn = "⚠️ 데모 / 업로드 모드"
+    last_sync = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if sheet["configured"] else "-"
+    detected = ", ".join(f"{k}={v}" for k, v in sheet.get("detected", {}).items()) or "-"
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Google Sheets 연결 상태", "연결됨" if sheet["configured"] else ("오류" if sheet["error"] else "데모"))
+    c2.metric("CCONMA 총 재고 수량", fmt(val["cc_total"]))
+    c3.metric("총 행 수 (CCONMA)", fmt(cc_idx.get("n_rows", 0)))
+    c4, c5, c6 = st.columns(3)
+    c4.metric("매칭 성공 SKU 수", fmt(val["matched"]))
+    c5.metric("매칭 실패 SKU 수", fmt(val["failed"]))
+    c6.metric("선택된 CCONMA 컬럼", str(cc_idx.get("col") or "-"))
+
+    info_rows = [
+        ("연결 상태", conn),
+        ("마지막 동기화 시간", last_sync),
+        ("읽어온 시트명", detected),
+        ("총 행 수 (CCONMA 시트)", str(cc_idx.get("n_rows", 0))),
+        ("실제 선택된 CCONMA 컬럼명", str(cc_idx.get("col") or "-")),
+        ("CCONMA 컬럼 인식 방식", str(cc_idx.get("col_method", "-"))),
+        ("CCONMA 총 재고 수량", fmt(val["cc_total"])),
+        ("매칭 성공 SKU 수", str(val["matched"])),
+        ("매칭 실패 SKU 수", str(val["failed"])),
+        ("인식된 컬럼 목록", ", ".join(cc_idx.get("columns", [])) or "-"),
+    ]
+    st.table(pd.DataFrame(info_rows, columns=["항목", "값"]))
+
+    st.subheader("매칭 실패 SKU")
+    st.caption("CCONMA 시트에는 있으나 Internal Code · SKU · ASIN 어느 것으로도 마스터와 매칭되지 않은 행")
+    fr = val["failed_rows"]
+    if fr is not None and not fr.empty:
+        st.dataframe(fr, use_container_width=True, height=360)
+        download_btn(fr, "⬇ 실패 SKU CSV", "cconma_unmatched.csv")
+    else:
+        st.success("매칭 실패 행 없음 (또는 데모 모드)")
+
+    st.divider()
+    st.subheader("연동 가이드")
+    st.markdown(
+        "- 환경변수: `GOOGLE_SHEET_ID`, `GOOGLE_SERVICE_ACCOUNT_JSON`(원문/base64) 또는 `GOOGLE_API_KEY`\n"
+        "- CCONMA 컬럼 인식: ①이름 'CCONMA' ②이름에 'CCONMA' 포함 ③M열\n"
+        "- 매칭 우선순위: ①Internal Code ②SKU(SAP CODE) ③ASIN")
+
+
 def page_sales(S, brand):
     st.title("Sales Dashboard")
     master = S["master"]
@@ -1023,7 +1196,7 @@ def main():
     with st.sidebar:
         st.markdown("### 📦 재고 관제")
         st.caption("Inventory Control")
-        menu_items = ["Home", "Amazon Inventory", "Inventory Planning", "TikTok Inventory", "Sales"]
+        menu_items = ["Home", "Amazon Inventory", "Inventory Planning", "TikTok Inventory", "Sales", "Settings"]
         st.session_state["menu"] = st.radio("메뉴", menu_items,
                                             index=menu_items.index(st.session_state.get("menu", "Home")))
         st.divider()
@@ -1064,6 +1237,8 @@ def main():
         page_tiktok_inventory(S, brand)
     elif menu == "Sales":
         page_sales(S, brand)
+    elif menu == "Settings":
+        page_settings(S, brand)
 
 
 def _read_upload(file):
