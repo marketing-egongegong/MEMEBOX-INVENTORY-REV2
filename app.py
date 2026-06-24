@@ -391,57 +391,56 @@ def _values_to_df(values):
 
 @st.cache_data(ttl=REFRESH_TTL, show_spinner=False)
 def read_sheet(sheet_id, _auth_key):
-    out = {"configured": False, "error": None,
-           "cconma": pd.DataFrame(), "fba": pd.DataFrame(),
-           "sales": pd.DataFrame(), "master": pd.DataFrame(), "detected": {}}
-    if not sheet_id:
-        out["error"] = "GOOGLE_SHEET_ID 미설정"
-        return out
+    out = {"configured": False, "error": None,
+           "cconma": pd.DataFrame(), "fba": pd.DataFrame(),
+           "sales": pd.DataFrame(), "master": pd.DataFrame(), "detected": {}}
+    if not sheet_id:
+        out["error"] = "GOOGLE_SHEET_ID 미설정"
+        return out
 
-    api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
-    try:
-        from googleapiclient.discovery import build
-        if api_key:
-            svc = build("sheets", "v4", developerKey=api_key, cache_discovery=False)
-        else:
-            creds, err = _credentials()
-            if err:
-                out["error"] = err
-                return out
-            svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+    try:
+        from googleapiclient.discovery import build
+        if api_key:
+            svc = build("sheets", "v4", developerKey=api_key, cache_discovery=False)
+        else:
+            creds, err = _credentials()
+            if err:
+                out["error"] = err
+                return out
+            svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
 
-        meta = svc.spreadsheets().get(spreadsheetId=sheet_id, fields="sheets.properties.title").execute()
-        titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+        meta = svc.spreadsheets().get(spreadsheetId=sheet_id, fields="sheets.properties.title").execute()
+        titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
 
-        def has(t, *keys):
-            tn = norm(t)
-            return any(norm(k) in tn for k in keys)
+        def has(t, *keys):
+            tn = norm(t)
+            return any(norm(k) in tn for k in keys)
 
-        role = {}
-        for t in titles:
-            if "cconma" not in role and has(t, "cconma"):
-                role["cconma"] = t
-            elif "fba" not in role and has(t, "fba"):
-                role["fba"] = t
-            elif "sales" not in role and (has(t, "일별") or has(t, "saleshist") or has(t, "dailysales")):
-                role["sales"] = t
-            elif "master" not in role and (has(t, "productinfo") or has(t, "master") or has(t, "마스터")):
-                role["master"] = t
-        out["detected"] = role
-        if role:
-            resp = svc.spreadsheets().values().batchGet(
-                spreadsheetId=sheet_id,
-                ranges=[f"'{t}'" for t in role.values()],
-                valueRenderOption="UNFORMATTED_VALUE").execute()
-            ranges = resp.get("valueRanges", [])
-            for i, key in enumerate(role.keys()):
-                vals = ranges[i].get("values", []) if i < len(ranges) else []
-                out[key] = _values_to_df(vals)
-        out["configured"] = True
-    except Exception as e:  # noqa: BLE001
-        out["error"] = f"시트 읽기 실패: {e}"
-    return out
-
+        role = {}
+        for t in titles:
+            if "cconma" not in role and has(t, "cconma"):
+                role["cconma"] = t
+            elif "fba" not in role and has(t, "fba"):
+                role["fba"] = t
+            elif "sales" not in role and (has(t, "일별") or has(t, "saleshist") or has(t, "dailysales")):
+                role["sales"] = t
+            elif "master" not in role and (has(t, "productinfo") or has(t, "master") or has(t, "마스터")):
+                role["master"] = t
+        out["detected"] = role
+        if role:
+            resp = svc.spreadsheets().values().batchGet(
+                spreadsheetId=sheet_id,
+                ranges=[f"'{t}'" for t in role.values()],
+                valueRenderOption="UNFORMATTED_VALUE").execute()
+            ranges = resp.get("valueRanges", [])
+            for i, key in enumerate(role.keys()):
+                vals = ranges[i].get("values", []) if i < len(ranges) else []
+                out[key] = _values_to_df(vals)
+        out["configured"] = True
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"시트 읽기 실패: {e}"
+    return out
 
 # ============================ INDEX SOURCES ============================
 def index_inv(df, qty_cands=None):
