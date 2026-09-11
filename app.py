@@ -57,6 +57,8 @@ STATUS_CRIT, STATUS_WARN = 30, 60
 PO_THRESHOLD, PO_TARGET_DAYS = 45, 90
 TR_FBA_DAYS, TR_TARGET_DAYS = 30, 60
 REFRESH_TTL = 300  # 5 min
+FX_FALLBACK = 1380.0  # 환율 조회 실패 시 사용
+DEMO_DAYS = 180  # 데모 판매 이력 길이 — 월별/주별 추이를 보려면 30일보다 길어야 함
 
 COLORS = {"crit": "#F87171", "warn": "#FBBF24", "heal": "#34D399",
           "amz": "#FF9900", "tt": "#FE2C55", "accent": "#2DD4BF"}
@@ -782,13 +784,17 @@ def gen_demo(master):
         a = {"s7": 0.0, "s30": 0.0, "daily": {}}
         t = {"s7": 0.0, "s30": 0.0, "daily": {}}
         price = p["price"] or 12
-        for d in range(29, -1, -1):
+        for d in range(DEMO_DAYS - 1, -1, -1):
             dt = now - timedelta(days=d)
             wk = 1.25 if dt.weekday() >= 5 else 1.0
-            u = max(0, round(velo * wk * (0.5 + rnd.random())))
-            tu = max(0, round(tvelo * wk * (0.5 + rnd.random())))
-            a["s30"] += u
-            t["s30"] += tu
+            # 완만한 성장 + 월 단위 굴곡을 넣어 월별/주별 추이가 의미를 갖게 한다
+            trend = 0.75 + 0.5 * (DEMO_DAYS - d) / DEMO_DAYS
+            seas = 1.0 + 0.18 * ((dt.month * 7 + i) % 5 - 2) / 2.0
+            u = max(0, round(velo * wk * trend * seas * (0.5 + rnd.random())))
+            tu = max(0, round(tvelo * wk * trend * seas * (0.5 + rnd.random())))
+            if d < 30:
+                a["s30"] += u
+                t["s30"] += tu
             if d < 7:
                 a["s7"] += u
                 t["s7"] += tu
@@ -907,12 +913,14 @@ def sales_aggregate(master, sales, brand, names_filter=None):
         return daily.get(k, {}).get(f, 0.0)
 
     def last(n, f):
-        return sum(v[f] for _, v in entries[-n:])
+        # 실제 날짜 창 기준 — 판매가 없는 날이 빠져도 기간이 늘어나지 않는다
+        cut = window_start(n)
+        return sum(v[f] for k, v in daily.items() if k >= cut)
 
     r_month = sum(v["rev"] for k, v in daily.items() if k[:7] == this_m)
     r_prev = sum(v["rev"] for k, v in daily.items() if k[:7] == prev_m)
     return {
-        "entries": entries,
+        "entries": entries[-30:],
         "u_today": g(today, "u"), "u_7": last(7, "u"), "u_30": last(30, "u"),
         "r_today": g(today, "rev"), "r_yest": g(yest, "rev"),
         "r_7": last(7, "rev"), "r_30": last(30, "rev"),
@@ -920,15 +928,16 @@ def sales_aggregate(master, sales, brand, names_filter=None):
     }
 
 
-def sku_revenue_table(master, sales, brand):
+def sku_revenue_table(master, sales, brand, days=30):
+    cut = window_start(days) if days else ""
     bybrand = {r["SKU"]: (r["Brand"], r["Product Name"]) for _, r in master.iterrows()}
     rows = []
     for sku, o in sales.items():
         b, nm = bybrand.get(sku, ("", sku))
         if brand and b != brand:
             continue
-        rev = sum(c["rev"] for c in o.get("daily", {}).values())
-        units = sum(c["u"] for c in o.get("daily", {}).values())
+        rev = sum(c["rev"] for dk, c in o.get("daily", {}).items() if not cut or dk >= cut)
+        units = sum(c["u"] for dk, c in o.get("daily", {}).items() if not cut or dk >= cut)
         if rev or units:
             rows.append({"SKU": sku, "Product Name": nm, "Brand": b,
                          "30D Units": round(units), "30D Revenue": round(rev)})
@@ -938,14 +947,15 @@ def sku_revenue_table(master, sales, brand):
     return df
 
 
-def brand_revenue(master, sales):
+def brand_revenue(master, sales, days=30):
+    cut = window_start(days) if days else ""
     bybrand = {r["SKU"]: r["Brand"] for _, r in master.iterrows()}
     agg = {}
     for sku, o in sales.items():
         b = bybrand.get(sku, "")
         if not b:
             continue
-        rev = sum(c["rev"] for c in o.get("daily", {}).values())
+        rev = sum(c["rev"] for dk, c in o.get("daily", {}).items() if not cut or dk >= cut)
         agg[b] = agg.get(b, 0.0) + rev
     df = pd.DataFrame([{"Brand": k, "Revenue": round(v)} for k, v in agg.items()])
     if not df.empty:
@@ -954,8 +964,14 @@ def brand_revenue(master, sales):
 
 
 # ============================ BRAND AGGREGATION ============================
-def _sales_totals(sales, skus):
-    """(units, revenue) — daily가 없으면 s30 집계값으로 대체."""
+def window_start(days):
+    """ISO 날짜 문자열 비교용 시작일 (오늘 포함 최근 days일)."""
+    return (datetime.now() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+
+
+def _sales_totals(sales, skus, days=30):
+    """(units, revenue) — 최근 days일. daily가 없으면 s30 집계값으로 대체."""
+    cut = window_start(days)
     units = rev = 0.0
     for s in skus:
         o = sales.get(s)
@@ -963,21 +979,25 @@ def _sales_totals(sales, skus):
             continue
         daily = o.get("daily", {})
         if daily:
-            for c in daily.values():
-                units += c["u"]
-                rev += c["rev"]
+            for dk, c in daily.items():
+                if dk >= cut:
+                    units += c["u"]
+                    rev += c["rev"]
         else:
             units += o.get("s30", 0.0)
     return units, rev
 
 
-def brand_daily(master, sales):
+def brand_daily(master, sales, days=30):
     """브랜드 × 날짜 매출/판매량 시계열."""
+    cut = window_start(days) if days else ""
     bmap = {r["SKU"]: r["Brand"] for _, r in master.iterrows()}
     acc = {}
     for sku, o in sales.items():
         b = bmap.get(sku, BRAND_UNASSIGNED)
         for dk, cell in o.get("daily", {}).items():
+            if cut and dk < cut:
+                continue
             k = (dk, b)
             d = acc.setdefault(k, {"units": 0.0, "revenue": 0.0})
             d["units"] += cell["u"]
@@ -1039,14 +1059,15 @@ def brand_rollup(master, amazon, tiktok, asales, tsales, ads):
     return df
 
 
-def keyword_revenue(master, sales, brand_kw, name_kw):
+def keyword_revenue(master, sales, brand_kw, name_kw, days=30):
     """Sum 30D revenue for SKUs whose brand+name match the keywords."""
+    cut = window_start(days) if days else ""
     total = 0.0
     info = {r["SKU"]: (r["Brand"], r["Product Name"]) for _, r in master.iterrows()}
     for sku, o in sales.items():
         b, nm = info.get(sku, ("", ""))
         if brand_kw.lower() in b.lower() and name_kw.lower() in nm.lower():
-            total += sum(c["rev"] for c in o.get("daily", {}).values())
+            total += sum(c["rev"] for dk, c in o.get("daily", {}).items() if not cut or dk >= cut)
     return total
 
 
@@ -1183,7 +1204,7 @@ def style_status(df):
     return sty
 
 
-def daily_line(entries, title, color):
+def daily_line(entries, title, color, key=None):
     if not entries:
         st.info("일별 데이터 없음")
         return
@@ -1192,10 +1213,10 @@ def daily_line(entries, title, color):
     fig.update_traces(line_color=color, fillcolor=color.replace(")", ", 0.15)").replace("rgb", "rgba") if color.startswith("rgb") else color)
     fig.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10),
                       paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key=key)
 
 
-def hbar(df, x, y, title, color):
+def hbar(df, x, y, title, color, key=None):
     if df is None or df.empty:
         st.info("데이터 없음")
         return
@@ -1204,7 +1225,7 @@ def hbar(df, x, y, title, color):
     fig.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10),
                       yaxis=dict(autorange="reversed"),
                       paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key=key)
 
 
 def download_btn(df, label, name):
@@ -1214,30 +1235,481 @@ def download_btn(df, label, name):
     st.download_button(label, csv, file_name=name, mime="text/csv")
 
 
+# ============================ ELROEL STYLE UI ============================
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_usd_krw(year, month):
+    """해당 월의 USD/KRW 평균 환율 (1일·15일·말일 샘플). 실패 시 None."""
+    env = os.environ.get("USD_KRW_RATE", "").strip()
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            pass
+    import calendar
+    import urllib.request
+    last_day = calendar.monthrange(year, month)[1]
+    rates = []
+    for day in (1, 15, last_day):
+        url = (f"https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@"
+               f"{year}-{month:02d}-{day:02d}/v1/currencies/usd.json")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=6) as r:
+                krw = json.loads(r.read()).get("usd", {}).get("krw")
+            if krw:
+                rates.append(float(krw))
+        except Exception:  # noqa: BLE001
+            continue
+    return round(sum(rates) / len(rates), 1) if rates else None
+
+
+def get_rate():
+    now = datetime.now()
+    return fetch_usd_krw(now.year, now.month) or FX_FALLBACK
+
+
+def krw_short(usd, rate):
+    """$ 금액을 억/만 단위 원화 문자열로."""
+    try:
+        usd = float(usd)
+    except (ValueError, TypeError):
+        return ""
+    if usd <= 0:
+        return ""
+    w = usd * rate
+    if w >= 100_000_000:
+        return f"₩{w / 100_000_000:.1f}억"
+    if w >= 10_000:
+        return f"₩{w / 10_000:,.0f}만"
+    return f"₩{w:,.0f}"
+
+
+def metric_pair(c_main, c_side, label, value, delta=None, krw_usd=None,
+                rate=None, sub_label=None, sub_value=None, note=None, help=None):
+    """ELROEL 스타일: 큰 지표 + 옆칸에 원화 환산 / 일 평균 보조 정보."""
+    with c_main:
+        st.metric(label, value, delta=delta, help=help)
+    with c_side:
+        html = ""
+        if krw_usd and rate:
+            k = krw_short(krw_usd, rate)
+            if k:
+                html += f"<p style='margin-top:1.2rem;font-size:0.8rem;color:gray'>{k}</p>"
+        if sub_label:
+            top = "0.1rem" if html else "1.2rem"
+            html += (f"<p style='margin-top:{top};font-size:0.75rem;color:#9ca3af'>"
+                     f"📊 {sub_label}<br>{sub_value}</p>")
+        if note:
+            html += f"<p style='margin-top:0.1rem;font-size:0.7rem;color:#6b7280'>{note}</p>"
+        if html:
+            st.markdown(html, unsafe_allow_html=True)
+
+
+def render_frozen_table(df, frozen_cols=2, height=460, is_currency=False, today_col=None):
+    """좌측 열 고정 + 헤더 고정 스크롤 테이블 (ELROEL 스타일)."""
+    frozen_w, col_w = 190, 92
+
+    def _fmt(val, i):
+        if i < frozen_cols:
+            return str(val)
+        try:
+            num = float(val)
+            if num != num:
+                return "-"
+            if is_currency:
+                return f"${num:,.0f}"
+            return f"{int(num):,}" if num == int(num) else f"{num:,.2f}"
+        except (ValueError, TypeError):
+            return str(val)
+
+    head = ""
+    for i, col in enumerate(df.columns):
+        frozen = i < frozen_cols
+        w = frozen_w if frozen else col_w
+        pos = (f"position:sticky;left:{i * frozen_w}px;z-index:10;" if frozen
+               else "position:sticky;z-index:8;")
+        hl = "background:#1a5c2a!important;color:#7fff7f;" if col == today_col else ""
+        head += (f'<th style="padding:6px 8px;text-align:center;white-space:nowrap;'
+                 f'border-bottom:2px solid #4a6fa5;font-size:0.78rem;background:#1e3a5f;'
+                 f'min-width:{w}px;width:{w}px;box-sizing:border-box;{pos}{hl}">{col}</th>')
+
+    body = ""
+    for ri, (_, row) in enumerate(df.iterrows()):
+        is_sum = str(row.iloc[0]).startswith("📊")
+        bg = "#1a2a3a" if is_sum else ("#16213e" if ri % 2 == 0 else "#1a2744")
+        cells = ""
+        for ci, (col, val) in enumerate(row.items()):
+            frozen = ci < frozen_cols
+            w = frozen_w if frozen else col_w
+            pos = (f"position:sticky;left:{ci * frozen_w}px;z-index:2;background:{bg};"
+                   f"min-width:{w}px;max-width:{w}px;overflow:hidden;text-overflow:ellipsis;"
+                   if frozen else f"min-width:{w}px;")
+            hl = "background:#0d2b12!important;color:#7fff7f;" if col == today_col else ""
+            sm = "font-weight:bold;color:#7fc4ff;" if is_sum else ""
+            cells += (f'<td style="padding:5px 8px;text-align:{"left" if frozen else "right"};'
+                      f'white-space:nowrap;font-size:0.78rem;border-bottom:1px solid #2a3a4a;'
+                      f'{pos}{hl}{sm}">{_fmt(val, ci)}</td>')
+        body += f'<tr style="background:{bg}">{cells}</tr>'
+
+    st.html(f"""
+    <div style="overflow:auto;height:{height}px;border:1px solid #2a3a4a;border-radius:6px;">
+      <table style="border-collapse:collapse;width:max-content;background:#16213e;color:#e0e8f0;">
+        <thead style="position:sticky;top:0;z-index:9;"><tr style="background:#1e3a5f;">{head}</tr></thead>
+        <tbody>{body}</tbody>
+      </table>
+    </div>""")
+
+
+# ============================ PERIOD AGGREGATION ============================
+def sales_timeseries(master, sales, brand=None):
+    """브랜드 필터가 적용된 일별 매출/판매량 시계열."""
+    bmap = {r["SKU"]: r["Brand"] for _, r in master.iterrows()}
+    acc = {}
+    for sku, o in sales.items():
+        if brand and bmap.get(sku, "") != brand:
+            continue
+        for dk, cell in o.get("daily", {}).items():
+            a = acc.setdefault(dk, [0.0, 0.0])
+            a[0] += cell["u"]
+            a[1] += cell["rev"]
+    if not acc:
+        return pd.DataFrame(columns=["date", "units", "revenue"])
+    rows = [{"date": pd.to_datetime(k), "units": v[0], "revenue": v[1]}
+            for k, v in sorted(acc.items())]
+    return pd.DataFrame(rows)
+
+
+def _period_days(p):
+    """기간의 일수. 진행 중인 기간이면 오늘까지의 경과 일수."""
+    today = datetime.now().date()
+    start, end = p.start_time.date(), p.end_time.date()
+    if end > today:
+        return max((today - start).days + 1, 1)
+    return (end - start).days + 1
+
+
+def agg_period(ts, period="monthly"):
+    """일별 시계열 -> 월별/주별 집계 (매출 · 판매량 · 일평균 · 증감률)."""
+    cols = ["기간", "_p", "revenue", "units", "days", "일 평균", "변화율"]
+    if ts is None or ts.empty:
+        return pd.DataFrame(columns=cols)
+    df = ts.copy()
+    if period == "monthly":
+        df["_p"] = df["date"].dt.to_period("M")
+    else:
+        df["_p"] = df["date"].dt.to_period("W")
+    g = df.groupby("_p", as_index=False).agg(revenue=("revenue", "sum"),
+                                             units=("units", "sum"))
+    g = g.sort_values("_p").reset_index(drop=True)
+    if period == "monthly":
+        g["기간"] = g["_p"].apply(lambda p: f"{p.year}년 {p.month}월")
+    else:
+        g["기간"] = g["_p"].apply(
+            lambda p: f"{p.start_time.month}/{p.start_time.day}~{p.end_time.month}/{p.end_time.day}")
+    g["days"] = g["_p"].apply(_period_days)
+    g["일 평균"] = g.apply(lambda r: r["revenue"] / r["days"] if r["days"] else None, axis=1)
+    g["변화율"] = g["revenue"].pct_change() * 100
+    return g[cols]
+
+
+def ads_by_period(ads, period="monthly", brand=None):
+    """기간 라벨 -> {spend, adsales}. 날짜가 없는 광고 행은 제외."""
+    out = {}
+    if ads is None or ads.empty or "Date" not in ads.columns:
+        return out
+    df = ads[ads["Date"].astype(str).str.len() > 0].copy()
+    if brand:
+        df = df[df["Brand"] == brand]
+    if df.empty:
+        return out
+    df["_dt"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["_dt"])
+    if df.empty:
+        return out
+    if period == "monthly":
+        df["_p"] = df["_dt"].dt.to_period("M")
+        df["기간"] = df["_p"].apply(lambda p: f"{p.year}년 {p.month}월")
+    else:
+        df["_p"] = df["_dt"].dt.to_period("W")
+        df["기간"] = df["_p"].apply(
+            lambda p: f"{p.start_time.month}/{p.start_time.day}~{p.end_time.month}/{p.end_time.day}")
+    for label, grp in df.groupby("기간"):
+        out[label] = {"spend": float(grp["Spend"].sum()),
+                      "adsales": float(grp["Ad Sales"].sum())}
+    return out
+
+
+def brand_period_matrix(master, sales, period="monthly", brand=None):
+    """브랜드 × 기간 매출 행렬 (ELROEL의 계정별 비교 차트에 대응)."""
+    bmap = {r["SKU"]: r["Brand"] for _, r in master.iterrows()}
+    acc = {}
+    for sku, o in sales.items():
+        b = bmap.get(sku, BRAND_UNASSIGNED)
+        if brand and b != brand:
+            continue
+        for dk, cell in o.get("daily", {}).items():
+            acc.setdefault(b, {}).setdefault(dk, 0.0)
+            acc[b][dk] += cell["rev"]
+    rows = []
+    for b, days in acc.items():
+        for dk, rev in days.items():
+            rows.append({"Brand": b, "date": pd.to_datetime(dk), "revenue": rev})
+    if not rows:
+        return pd.DataFrame(columns=["Brand", "기간", "revenue"])
+    df = pd.DataFrame(rows)
+    if period == "monthly":
+        df["_p"] = df["date"].dt.to_period("M")
+        df["기간"] = df["_p"].apply(lambda p: f"{p.year}년 {p.month}월")
+    else:
+        df["_p"] = df["date"].dt.to_period("W")
+        df["기간"] = df["_p"].apply(
+            lambda p: f"{p.start_time.month}/{p.start_time.day}~{p.end_time.month}/{p.end_time.day}")
+    g = df.groupby(["Brand", "기간", "_p"], as_index=False)["revenue"].sum()
+    return g.sort_values("_p").reset_index(drop=True)
+
+
+def product_period_pivot(master, sales, period="monthly", brand=None, metric="revenue", top=40):
+    """제품 × 기간 행렬 + 합계 행 (고정열 테이블용)."""
+    info = {r["SKU"]: (r["Brand"], r["Product Name"]) for _, r in master.iterrows()}
+    rows = []
+    for sku, o in sales.items():
+        b, nm = info.get(sku, (BRAND_UNASSIGNED, sku))
+        if brand and b != brand:
+            continue
+        for dk, cell in o.get("daily", {}).items():
+            rows.append({"Brand": b, "제품명": nm, "date": pd.to_datetime(dk),
+                         "val": cell["rev"] if metric == "revenue" else cell["u"]})
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    if period == "monthly":
+        df["_p"] = df["date"].dt.to_period("M")
+        df["기간"] = df["_p"].apply(lambda p: f"{p.year}-{p.month:02d}")
+    else:
+        df["_p"] = df["date"].dt.to_period("W")
+        df["기간"] = df["_p"].apply(lambda p: p.start_time.strftime("%m/%d"))
+    order = df.drop_duplicates("_p").sort_values("_p")["기간"].tolist()
+    piv = df.pivot_table(index=["Brand", "제품명"], columns="기간",
+                         values="val", aggfunc="sum", fill_value=0).reset_index()
+    piv = piv[["Brand", "제품명"] + [c for c in order if c in piv.columns]]
+    piv["_tot"] = piv[[c for c in order if c in piv.columns]].sum(axis=1)
+    piv = piv.sort_values("_tot", ascending=False).head(top).drop(columns=["_tot"])
+    total = {"Brand": "📊 합계", "제품명": ""}
+    for c in order:
+        if c in piv.columns:
+            total[c] = piv[c].sum()
+    return pd.concat([pd.DataFrame([total]), piv], ignore_index=True)
+
+
 # ============================ PAGES ============================
 def page_home(S, brand):
-    st.title("Home Dashboard")
+    st.title("📊 재고 · 판매 통합 대시보드")
     sheet = S["sheet"]
     src = "Google Sheet 연동" if sheet["configured"] else ("데모 데이터" if st.session_state.get("demo", True) else "업로드 데이터")
-    st.caption(f"Amazon + TikTok Shop 재고 관제 · {src}")
+    st.caption(f"Amazon + TikTok Shop · {brand or '전체 브랜드'} 기준 · {src}")
+
+    master = S["master"]
+    rate = get_rate()
+    st.caption(f"💱 적용 환율: **{rate:,.1f}원/$** (당월 평균)")
+
+    amz_ts = sales_timeseries(master, S["asales"], brand)
+    tt_ts = sales_timeseries(master, S["tsales"], brand)
+    amz_m = agg_period(amz_ts, "monthly")
+    tt_m = agg_period(tt_ts, "monthly")
+
+    def month_row(g, offset=0):
+        """0=이번 달, 1=전월."""
+        if g is None or g.empty:
+            return None
+        now = pd.Period(datetime.now(), freq="M") - offset
+        hit = g[g["_p"] == now]
+        return hit.iloc[0] if not hit.empty else None
+
+    a_now, a_prev = month_row(amz_m, 0), month_row(amz_m, 1)
+    t_now, t_prev = month_row(tt_m, 0), month_row(tt_m, 1)
+    a_rev = float(a_now["revenue"]) if a_now is not None else 0.0
+    a_pre = float(a_prev["revenue"]) if a_prev is not None else 0.0
+    t_rev = float(t_now["revenue"]) if t_now is not None else 0.0
+    t_pre = float(t_prev["revenue"]) if t_prev is not None else 0.0
+    total, total_pre = a_rev + t_rev, a_pre + t_pre
+    days_elapsed = max(datetime.now().day, 1)
+
+    def mom(cur, prev):
+        return f"{(cur - prev) / prev * 100:+.1f}%" if prev > 0 else None
+
+    st.subheader(f"📅 {datetime.now().year}년 {datetime.now().month}월 통합 핵심 지표")
+    c1a, c1b, c2a, c2b, c3a, c3b = st.columns([2.5, 1, 2.5, 1, 2.5, 1])
+    metric_pair(c1a, c1b, "💰 통합 총 GMV", f"${total:,.2f}" if total else "-",
+                delta=mom(total, total_pre), krw_usd=total, rate=rate,
+                sub_label=f"일 평균 (1~{days_elapsed}일)",
+                sub_value=f"${total / days_elapsed:,.2f}" if total else "-")
+    metric_pair(c2a, c2b, "📦 Amazon GMV", f"${a_rev:,.2f}" if a_rev else "-",
+                delta=mom(a_rev, a_pre), krw_usd=a_rev, rate=rate,
+                sub_label="일 평균", sub_value=f"${a_rev / days_elapsed:,.2f}" if a_rev else "-",
+                note=f"{total and a_rev / total * 100:.0f}% 비중" if total else None)
+    metric_pair(c3a, c3b, "🛍️ TikTok GMV", f"${t_rev:,.2f}" if t_rev else "-",
+                delta=mom(t_rev, t_pre), krw_usd=t_rev, rate=rate,
+                sub_label="일 평균", sub_value=f"${t_rev / days_elapsed:,.2f}" if t_rev else "-",
+                note=f"{total and t_rev / total * 100:.0f}% 비중" if total else None)
+
+    ad_month = ads_by_period(S["ads"], "monthly", brand or None)
+    cur_label = f"{datetime.now().year}년 {datetime.now().month}월"
+    spend = ad_month.get(cur_label, {}).get("spend", 0.0)
+    tacos = (spend / total * 100) if total and spend else None
+    a_units = float(a_now["units"]) if a_now is not None else 0.0
+    t_units = float(t_now["units"]) if t_now is not None else 0.0
+
+    c4a, c4b, c5a, c5b, c6a, c6b = st.columns([2.5, 1, 2.5, 1, 2.5, 1])
+    metric_pair(c4a, c4b, "📢 TACOS", f"{tacos:.2f}%" if tacos else "-",
+                help="TACOS = 총 광고비 ÷ 통합 총 GMV × 100")
+    metric_pair(c5a, c5b, "💸 총 광고비", f"${spend:,.2f}" if spend else "-",
+                krw_usd=spend, rate=rate,
+                help="캠페인 단위 광고비 합계 (사이드바 업로드 또는 시트 광고 탭)")
+    metric_pair(c6a, c6b, "🧾 통합 판매량", fmt(a_units + t_units),
+                sub_label="Amazon / TikTok",
+                sub_value=f"{fmt(a_units)} / {fmt(t_units)}")
+
+    # ============ 재고 현황 ============
+    st.divider()
+    st.subheader("📦 재고 현황")
     amz = apply_filters(S["amazon"], brand, "")
+    tt = apply_filters(S["tiktok"], brand, "")
     po = apply_filters(S["po"], brand, "")
     tr = apply_filters(S["tr"], brand, "")
-    crit = int((amz["Status"] == "Critical").sum()) if not amz.empty else 0
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("활성 SKU", fmt(len(amz)), brand or "전체 브랜드")
-    c2.metric("Critical", crit, "Coverage < 30일")
-    c3.metric("발주 필요", len(po) if po is not None else 0, "Coverage < 45일")
-    c4.metric("SO 필요", len(tr) if tr is not None else 0, "FBA Cov < 30일")
+
+    def col_sum(df, c):
+        return ifloor(df[c].sum()) if (df is not None and not df.empty and c in df.columns) else 0
+
+    amz_inv = col_sum(amz, "Total Inventory")
+    cc_inv = col_sum(amz, "CCONMA Inventory")
+    fba_inv = col_sum(amz, "Total FBA Inventory")
+    tt_inv = col_sum(tt, "Total")
+    crit = int((amz["Status"] == "Critical").sum()) if (amz is not None and not amz.empty) else 0
+    warn = int((amz["Status"] == "Warning").sum()) if (amz is not None and not amz.empty) else 0
+    heal = int((amz["Status"] == "Healthy").sum()) if (amz is not None and not amz.empty) else 0
+    daily_avg = amz["DailyAvg"].sum() if (amz is not None and "DailyAvg" in amz.columns) else 0
+    avg_cov = (amz_inv / daily_avg) if daily_avg > 0 else None
+    inv_value = 0.0
+    if amz is not None and not amz.empty:
+        price_map = {r["SKU"]: r["price"] for _, r in master.iterrows()}
+        inv_value = sum(price_map.get(r["SKU"], 0.0) * r["Total Inventory"] for _, r in amz.iterrows())
+
+    i1a, i1b, i2a, i2b, i3a, i3b = st.columns([2.5, 1, 2.5, 1, 2.5, 1])
+    metric_pair(i1a, i1b, "📦 Amazon 총 재고", fmt(amz_inv),
+                sub_label="CCONMA / FBA", sub_value=f"{fmt(cc_inv)} / {fmt(fba_inv)}")
+    metric_pair(i2a, i2b, "🛍️ TikTok 총 재고", fmt(tt_inv),
+                sub_label="CCONMA + FBT", sub_value="-" if not tt_inv else fmt(tt_inv))
+    metric_pair(i3a, i3b, "⏳ 평균 재고 회전일",
+                f"{avg_cov:,.0f}일" if avg_cov else "-",
+                krw_usd=inv_value, rate=rate,
+                sub_label="재고 자산 (판매가 기준)",
+                sub_value=usd(inv_value) if inv_value else "-")
+
+    i4a, i4b, i5a, i5b, i6a, i6b = st.columns([2.5, 1, 2.5, 1, 2.5, 1])
+    metric_pair(i4a, i4b, "🚨 Critical SKU", fmt(crit),
+                sub_label="Warning / Healthy", sub_value=f"{fmt(warn)} / {fmt(heal)}")
+    metric_pair(i5a, i5b, "🧾 발주 필요 SKU", fmt(len(po) if po is not None else 0),
+                sub_label="기준", sub_value=f"Coverage < {PO_THRESHOLD}일")
+    metric_pair(i6a, i6b, "🚚 SO 필요 SKU", fmt(len(tr) if tr is not None else 0),
+                sub_label="기준", sub_value=f"FBA Cov < {TR_FBA_DAYS}일")
+
+    s1, s2 = st.columns([1, 1.6])
+    with s1:
+        if crit + warn + heal:
+            fig = go.Figure(go.Bar(
+                x=[crit, warn, heal], y=["Critical", "Warning", "Healthy"], orientation="h",
+                marker_color=[COLORS["crit"], COLORS["warn"], COLORS["heal"]],
+                text=[crit, warn, heal], textposition="outside"))
+            fig.update_layout(title="재고 상태 분포", height=260,
+                              margin=dict(l=10, r=10, t=40, b=10),
+                              yaxis=dict(autorange="reversed"),
+                              paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig, use_container_width=True, key="home_status_dist")
+    with s2:
+        if amz is not None and not amz.empty:
+            bs = amz.groupby("Brand").agg(
+                SKU=("SKU", "count"),
+                재고=("Total Inventory", "sum"),
+                Critical=("Status", lambda s: int((s == "Critical").sum())),
+            ).reset_index().sort_values("재고", ascending=False)
+            bs["재고"] = bs["재고"].apply(fmt)
+            st.markdown("**브랜드별 재고 요약**")
+            st.dataframe(bs, use_container_width=True, hide_index=True, height=220)
+
+    if amz is not None and not amz.empty and crit:
+        with st.expander(f"🚨 긴급 재고 — Critical {crit}건 (회전일 짧은 순)", expanded=False):
+            urg = amz[amz["Status"] == "Critical"].sort_values("CoverageDays").head(15)
+            st.dataframe(urg[["Brand", "SKU", "Product Name", "Total Inventory",
+                              "DailyAvg", "CoverageDays"]],
+                         use_container_width=True, hide_index=True)
+
+    # ============ 월별 통합 매출 추이 ============
     st.divider()
-    st.subheader("메뉴")
+    st.subheader("📈 월별 통합 매출 추이")
+    labels = []
+    for g in (amz_m, tt_m):
+        if g is not None and not g.empty:
+            labels += list(zip(g["_p"].tolist(), g["기간"].tolist()))
+    labels = [lbl for _, lbl in sorted(set(labels), key=lambda x: x[0])]
+
+    if not labels:
+        st.info("판매 데이터가 없습니다. 사이드바에서 데모를 켜거나 시트를 연동하세요.")
+    else:
+        a_map = dict(zip(amz_m["기간"], amz_m["revenue"])) if not amz_m.empty else {}
+        t_map = dict(zip(tt_m["기간"], tt_m["revenue"])) if not tt_m.empty else {}
+        a_vals = [a_map.get(m, 0) for m in labels]
+        t_vals = [t_map.get(m, 0) for m in labels]
+        c_vals = [a + t for a, t in zip(a_vals, t_vals)]
+
+        fig = go.Figure()
+        fig.add_bar(x=labels, y=a_vals, name="Amazon GMV", marker_color=COLORS["amz"])
+        fig.add_bar(x=labels, y=t_vals, name="TikTok GMV", marker_color=COLORS["tt"])
+        fig.add_scatter(x=labels, y=c_vals, name="통합 GMV", mode="lines+markers",
+                        line=dict(color="#22c55e", width=2.5), marker=dict(size=8))
+        fig.update_layout(barmode="group", height=400,
+                          xaxis={"categoryorder": "array", "categoryarray": labels},
+                          yaxis_tickprefix="$", yaxis_tickformat=",.0f",
+                          margin=dict(l=0, r=0, t=20, b=0),
+                          legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                          paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig, use_container_width=True, key="home_monthly_trend")
+
+        d_map = dict(zip(amz_m["기간"], amz_m["days"])) if not amz_m.empty else {}
+        d_map.update(dict(zip(tt_m["기간"], tt_m["days"])) if not tt_m.empty else {})
+        disp = pd.DataFrame({
+            "월": labels,
+            "통합 GMV": [usd(v) if v else "-" for v in c_vals],
+            "일 평균": [usd(c_vals[i] / d_map.get(m, 1)) if c_vals[i] else "-"
+                     for i, m in enumerate(labels)],
+            "원화 환산": [krw_short(v, rate) or "-" for v in c_vals],
+            "Amazon GMV": [usd(v) if v else "-" for v in a_vals],
+            "TikTok GMV": [usd(v) if v else "-" for v in t_vals],
+            "MoM": ["-"] + [f"{(c_vals[i] - c_vals[i-1]) / c_vals[i-1] * 100:+.1f}%"
+                            if c_vals[i-1] > 0 else "-" for i in range(1, len(c_vals))],
+        })
+        st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    # ============ 브랜드 요약 + 메뉴 ============
+    st.divider()
+    roll = brand_rollup(master, S["amazon"], S["tiktok"], S["asales"], S["tsales"], S["ads"])
+    if not roll.empty:
+        st.subheader("🏷 브랜드별 요약 (최근 30일)")
+        bsum = roll[["Brand", "SKU 수", "총 매출 (30D)", "광고비 (30D)", "총 재고", "Critical SKU"]].copy()
+        bsum["총 매출 (30D)"] = bsum["총 매출 (30D)"].apply(usd)
+        bsum["광고비 (30D)"] = bsum["광고비 (30D)"].apply(lambda v: usd(v) if v else "-")
+        bsum["총 재고"] = bsum["총 재고"].apply(fmt)
+        st.dataframe(bsum, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("바로가기")
     cols = st.columns(3)
     menus = [("🏷 Brand", "Brand"), ("📦 Amazon Inventory", "Amazon Inventory"),
              ("📋 Inventory Planning", "Inventory Planning"),
-             ("🎵 TikTok Inventory", "TikTok Inventory"), ("📈 Sales", "Sales")]
+             ("🎵 TikTok Inventory", "TikTok Inventory"), ("📈 Sales", "Sales"),
+             ("⚙️ Settings", "Settings")]
     for i, (label, target) in enumerate(menus):
         with cols[i % 3]:
-            if st.button(label, use_container_width=True):
+            if st.button(label, use_container_width=True, key=f"nav_{target}"):
                 st.session_state["menu"] = target
                 st.rerun()
 
@@ -1385,7 +1857,7 @@ def page_brand(S, brand):
                      color_discrete_sequence=[COLORS["amz"], COLORS["tt"]])
         fig.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10),
                           paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="brand_channel_bar")
     with c2:
         bd = brand_daily(master, S["asales"])
         if brand and not bd.empty:
@@ -1398,7 +1870,7 @@ def page_brand(S, brand):
                           color_discrete_map=BRAND_COLORS)
             fig.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10),
                               paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="brand_daily_line")
 
     # ---- 광고비 ----
     st.divider()
@@ -1433,13 +1905,14 @@ def page_brand(S, brand):
         cc1, cc2 = st.columns(2)
         with cc1:
             hbar(ab.sort_values("Spend", ascending=False), "Spend", "Brand",
-                 "브랜드별 광고비", COLORS["accent"])
+                 "브랜드별 광고비", COLORS["accent"], key="brand_ad_spend")
         with cc2:
             camp = ads.groupby(["Campaign", "Brand"], dropna=False)["Spend"].sum().reset_index()
             if brand:
                 camp = camp[camp["Brand"] == brand]
             camp = camp.sort_values("Spend", ascending=False).head(10)
-            hbar(camp, "Spend", "Campaign", "캠페인 광고비 Top 10", COLORS["amz"])
+            hbar(camp, "Spend", "Campaign", "캠페인 광고비 Top 10", COLORS["amz"],
+                 key="brand_campaign_top")
         st.markdown("##### 캠페인 상세")
         st.dataframe(ads.sort_values("Spend", ascending=False), use_container_width=True, height=320)
         download_btn(ads, "⬇ 광고비 CSV", "ad_spend.csv")
@@ -1450,10 +1923,12 @@ def page_brand(S, brand):
     t1, t2 = st.tabs(["Amazon", "TikTok Shop"])
     with t1:
         hbar(sku_revenue_table(master, S["asales"], brand).head(10),
-             "30D Revenue", "Product Name", "Amazon · 30d", COLORS["amz"])
+             "30D Revenue", "Product Name", "Amazon · 30d", COLORS["amz"],
+             key="brand_sku_amz")
     with t2:
         hbar(sku_revenue_table(master, S["tsales"], brand).head(10),
-             "30D Revenue", "Product Name", "TikTok Shop · 30d", COLORS["tt"])
+             "30D Revenue", "Product Name", "TikTok Shop · 30d", COLORS["tt"],
+             key="brand_sku_tt")
 
     # ---- 미분류 경고 ----
     unassigned = master[master["Brand"] == BRAND_UNASSIGNED] if "Brand" in master.columns else pd.DataFrame()
@@ -1552,56 +2027,184 @@ def page_settings(S, brand):
         "- 광고비 탭 인식: 시트명에 '광고' · 'Campaign' · 'Advertising' 포함")
 
 
-def page_sales(S, brand):
-    st.title("Sales Dashboard")
+def render_period_view(S, brand, sales, channel, period, color):
+    """ELROEL 스타일 월별/주별 뷰: 브랜드 비교 차트 + 핵심 지표 테이블 + 광고 추이."""
     master = S["master"]
-    tab_amz, tab_tt = st.tabs(["Amazon Sales", "TikTok Shop Sales"])
+    rate = get_rate()
+    unit = "월" if period == "monthly" else "주"
+    delta_label = "MoM (%)" if period == "monthly" else "WoW (%)"
 
-    with tab_amz:
-        st.caption(f"Amazon · {brand or '전체 브랜드'} 기준")
+    ts = sales_timeseries(master, sales, brand)
+    g = agg_period(ts, period)
+    if g.empty:
+        st.info("판매 데이터가 없습니다.")
+        return
+    labels = g["기간"].tolist()
+
+    st.subheader(f"{unit}별 GMV")
+    bm = brand_period_matrix(master, sales, period, brand or None)
+    fig = go.Figure()
+    if not bm.empty and not brand:
+        for b in brand_options(master):
+            sub = bm[bm["Brand"] == b]
+            if sub.empty:
+                continue
+            vals = dict(zip(sub["기간"], sub["revenue"]))
+            fig.add_bar(x=labels, y=[vals.get(m, 0) for m in labels], name=b,
+                        marker_color=BRAND_COLORS.get(b, COLORS["accent"]))
+        fig.add_scatter(x=labels, y=g["revenue"].tolist(), name="합산",
+                        mode="lines+markers", line=dict(color="#22c55e", width=2, dash="dot"),
+                        marker=dict(size=8))
+        fig.update_layout(barmode="group")
+    else:
+        fig.add_bar(x=labels, y=g["revenue"].tolist(), name=brand or channel,
+                    marker_color=color,
+                    text=[f"${v:,.0f}" for v in g["revenue"]], textposition="outside")
+    fig.update_layout(height=420, xaxis={"categoryorder": "array", "categoryarray": labels},
+                      yaxis_tickprefix="$", yaxis_tickformat=",.0f",
+                      margin=dict(l=0, r=0, t=20, b=0),
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig, use_container_width=True, key=f"gmv_{channel}_{period}")
+    if not brand:
+        st.caption("💡 막대 = 브랜드별 GMV · 점선 = 전체 합산")
+
+    st.divider()
+    st.subheader(f"📋 {unit}별 핵심 지표")
+    adp = ads_by_period(S["ads"], period, brand or None)
+    disp = pd.DataFrame({
+        unit: labels,
+        "GMV": [usd(v) for v in g["revenue"]],
+        "일 평균": [usd(v) if v == v and v else "-" for v in g["일 평균"]],
+        "원화 환산": [krw_short(v, rate) or "-" for v in g["revenue"]],
+        delta_label: [f"{v:+.1f}%" if v == v else "-" for v in g["변화율"]],
+        "판매 수량": [fmt(v) for v in g["units"]],
+        "객단가": [usd(r / u) if u else "-" for r, u in zip(g["revenue"], g["units"])],
+    })
+    has_ad = any(m in adp for m in labels)
+    if has_ad:
+        spends = [adp.get(m, {}).get("spend", 0.0) for m in labels]
+        adsales = [adp.get(m, {}).get("adsales", 0.0) for m in labels]
+        disp["광고비"] = [usd(v) if v else "-" for v in spends]
+        disp["광고매출"] = [usd(v) if v else "-" for v in adsales]
+        disp["ACOS (%)"] = [f"{s / a * 100:.2f}%" if a else "-" for s, a in zip(spends, adsales)]
+        disp["TACOS (%)"] = [f"{s / r * 100:.2f}%" if (r and s) else "-"
+                             for s, r in zip(spends, g["revenue"])]
+    st.dataframe(disp, use_container_width=True, hide_index=True)
+    download_btn(g[["기간", "revenue", "units", "일 평균", "변화율"]],
+                 f"⬇ {unit}별 지표 CSV", f"{channel}_{period}_{brand or 'all'}.csv")
+
+    if has_ad:
+        st.divider()
+        st.subheader("📢 광고비 추이")
+        fa = go.Figure()
+        fa.add_bar(x=labels, y=[adp.get(m, {}).get("spend", 0.0) for m in labels],
+                   name="광고비", marker_color=COLORS["accent"])
+        fa.add_scatter(x=labels, y=[adp.get(m, {}).get("adsales", 0.0) for m in labels],
+                       name="광고매출", mode="lines+markers",
+                       line=dict(color="#22c55e", width=2, dash="dot"))
+        fa.update_layout(height=340, yaxis_tickprefix="$", yaxis_tickformat=",.0f",
+                         margin=dict(l=0, r=0, t=20, b=0),
+                         legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fa, use_container_width=True, key=f"ad_{channel}_{period}")
+    else:
+        st.caption("💡 광고비 데이터를 올리면 ACOS · TACOS · 광고비 추이가 함께 표시됩니다.")
+
+
+def render_detail_view(S, brand, sales, channel, color):
+    """ELROEL 상세 탭: 일별 추이 + 제품×기간 피벗 + 제품별 합계."""
+    master = S["master"]
+    ts = sales_timeseries(master, sales, brand)
+    if ts.empty:
+        st.info("판매 데이터가 없습니다.")
+        return
+
+    months = sorted({d.strftime("%Y-%m") for d in ts["date"]}, reverse=True)
+    sel = st.selectbox("기간 선택", ["전체"] + months, key=f"detail_{channel}")
+    view = ts if sel == "전체" else ts[ts["date"].dt.strftime("%Y-%m") == sel]
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("총 GMV", usd(view["revenue"].sum()))
+    k2.metric("총 판매량", fmt(view["units"].sum()))
+    k3.metric("일 평균 GMV", usd(view["revenue"].mean()) if len(view) else "-")
+    k4.metric("집계 일수", f"{len(view)}일")
+
+    st.subheader("📈 일별 GMV 추이")
+    fig = px.bar(view.sort_values("date"), x="date", y="revenue",
+                 labels={"revenue": "GMV ($)", "date": "날짜"},
+                 color_discrete_sequence=[color])
+    fig.update_layout(height=360, xaxis_tickangle=-45, yaxis_tickprefix="$",
+                      yaxis_tickformat=",.0f", margin=dict(l=0, r=0, t=20, b=0),
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig, use_container_width=True, key=f"daily_{channel}")
+
+    st.divider()
+    st.subheader("🛍️ 제품별 기간 매출")
+    cc1, cc2 = st.columns(2)
+    p_period = cc1.radio("집계 단위", ["월별", "주별"], horizontal=True, key=f"pp_{channel}")
+    p_metric = cc2.radio("지표", ["매출", "판매량"], horizontal=True, key=f"pm_{channel}")
+    piv = product_period_pivot(master, sales,
+                               "monthly" if p_period == "월별" else "weekly",
+                               brand or None,
+                               "revenue" if p_metric == "매출" else "units")
+    if piv is None or piv.empty:
+        st.info("집계할 제품 데이터가 없습니다.")
+    else:
+        st.caption(f"상위 {len(piv) - 1}개 제품 · 좌측 2개 열 고정 · 가로 스크롤")
+        render_frozen_table(piv, frozen_cols=2, height=460,
+                            is_currency=(p_metric == "매출"))
+        download_btn(piv, "⬇ 제품별 피벗 CSV", f"{channel}_product_pivot.csv")
+
+    st.divider()
+    st.subheader("🏆 제품별 합계 (최근 30일)")
+    full = sku_revenue_table(master, sales, brand)
+    if full.empty:
+        st.info("판매 데이터 없음")
+        return
+    total_rev = full["30D Revenue"].sum()
+    show = full.copy()
+    show["매출 비중"] = (show["30D Revenue"] / total_rev * 100).round(1).astype(str) + "%"
+    show["30D Revenue"] = show["30D Revenue"].apply(usd)
+    show["30D Units"] = show["30D Units"].apply(fmt)
+    st.dataframe(show, use_container_width=True, height=360, hide_index=True)
+    download_btn(full, "⬇ SKU 매출 CSV", f"{channel}_sku_sales_{brand or 'all'}.csv")
+    hbar(full.head(15), "30D Revenue", "Product Name", "매출 Top 15 · 30d", color,
+         key=f"top15_{channel}")
+
+
+def page_sales(S, brand):
+    st.title("📈 Sales Dashboard")
+    st.caption(f"Amazon + TikTok Shop 판매 분석 · {brand or '전체 브랜드'} 기준")
+    master = S["master"]
+
+    tabs = st.tabs(["🛒 Amazon 월별", "📦 Amazon 주별", "🔍 Amazon 상세",
+                    "📅 TikTok 월별", "📆 TikTok 주별", "📋 TikTok 상세"])
+
+    with tabs[0]:
+        render_period_view(S, brand, S["asales"], "amazon", "monthly", COLORS["amz"])
+    with tabs[1]:
+        render_period_view(S, brand, S["asales"], "amazon", "weekly", COLORS["amz"])
+    with tabs[2]:
         agg = sales_aggregate(master, S["asales"], brand)
         kpi_row(agg)
         st.markdown("##### 브랜드 특화 KPI")
         k1, k2 = st.columns(2)
-        nooni = keyword_revenue(master, S["asales"], "NOONI", "lip oil")
-        idc = keyword_revenue(master, S["asales"], "I DEW CARE", "tap secret")
-        k1.metric("NOONI Lip Oil 매출 (30D)", usd(nooni))
-        k2.metric("I DEW CARE Tap Secret 매출 (30D)", usd(idc))
+        k1.metric("NOONI Lip Oil 매출 (30D)",
+                  usd(keyword_revenue(master, S["asales"], "NOONI", "lip oil")))
+        k2.metric("I DEW CARE Tap Secret 매출 (30D)",
+                  usd(keyword_revenue(master, S["asales"], "I DEW CARE", "tap secret")))
         st.divider()
-        daily_line(agg["entries"], "Daily Sales Trend · 30d", COLORS["accent"])
-        c1, c2 = st.columns(2)
-        with c1:
-            sku_df = sku_revenue_table(master, S["asales"], brand).head(10)
-            hbar(sku_df, "30D Revenue", "Product Name", "SKU 매출 Top 10 · 30d", COLORS["amz"])
-        with c2:
-            br = brand_revenue(master, S["asales"]).head(5)
-            hbar(br, "Revenue", "Brand", "Brand Revenue · Top 5", COLORS["accent"])
-        st.markdown("##### SKU별 매출 분석")
-        full = sku_revenue_table(master, S["asales"], brand)
-        if not full.empty:
-            st.dataframe(full, use_container_width=True, height=360)
-            download_btn(full, "⬇ SKU 매출 CSV", f"amazon_sku_sales_{brand or 'all'}.csv")
-        else:
-            st.info("판매 데이터 없음")
+        render_detail_view(S, brand, S["asales"], "amazon", COLORS["amz"])
 
-    with tab_tt:
-        st.caption(f"TikTok Shop · {brand or '전체 브랜드'} 기준")
-        agg = sales_aggregate(master, S["tsales"], brand)
-        kpi_row(agg)
+    with tabs[3]:
+        render_period_view(S, brand, S["tsales"], "tiktok", "monthly", COLORS["tt"])
+    with tabs[4]:
+        render_period_view(S, brand, S["tsales"], "tiktok", "weekly", COLORS["tt"])
+    with tabs[5]:
+        kpi_row(sales_aggregate(master, S["tsales"], brand))
         st.divider()
-        daily_line(agg["entries"], "TikTok Daily Sales Trend · 30d", COLORS["tt"])
-        c1, c2 = st.columns(2)
-        with c1:
-            sku_df = sku_revenue_table(master, S["tsales"], brand).head(10)
-            hbar(sku_df, "30D Revenue", "Product Name", "SKU 매출 Top 10 · 30d", COLORS["tt"])
-        with c2:
-            br = brand_revenue(master, S["tsales"]).head(5)
-            hbar(br, "Revenue", "Brand", "Brand Revenue · Top 5", COLORS["accent"])
-        full = sku_revenue_table(master, S["tsales"], brand)
-        if not full.empty:
-            st.markdown("##### SKU별 매출 분석")
-            st.dataframe(full, use_container_width=True, height=360)
-            download_btn(full, "⬇ SKU 매출 CSV", f"tiktok_sku_sales_{brand or 'all'}.csv")
+        render_detail_view(S, brand, S["tsales"], "tiktok", COLORS["tt"])
 
 
 # ============================ MAIN ============================
