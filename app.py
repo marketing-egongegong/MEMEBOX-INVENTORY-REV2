@@ -61,6 +61,43 @@ REFRESH_TTL = 300  # 5 min
 COLORS = {"crit": "#F87171", "warn": "#FBBF24", "heal": "#34D399",
           "amz": "#FF9900", "tt": "#FE2C55", "accent": "#2DD4BF"}
 
+# ============================ BRAND ============================
+# 브랜드 귀속은 PRODUCT INFO F열(Internal Code)의 접두어를 1순위로 판정한다.
+BRAND_UNASSIGNED = "미분류"
+BRANDS = ["NOONI", "I DEW CARE", "I'M MEME", "KAJA"]
+
+# Internal Code 접두어 -> 정식 브랜드명 (긴 접두어부터 검사)
+BRAND_PREFIX = [
+    ("NOONI", "NOONI"),
+    ("KAJA", "KAJA"),
+    ("IDC", "I DEW CARE"),
+    ("IMM", "I'M MEME"),
+]
+
+# 브랜드명/제품명/캠페인명 등 자유 텍스트에서 브랜드를 찾을 때 쓰는 별칭
+BRAND_ALIASES = {
+    "NOONI": ["nooni"],
+    "I DEW CARE": ["idewcare", "dewcare", "idc"],
+    "I'M MEME": ["immeme", "imeme", "imm", "meme"],
+    "KAJA": ["kaja"],
+}
+
+BRAND_COLORS = {"NOONI": "#60A5FA", "I DEW CARE": "#34D399",
+                "I'M MEME": "#F472B6", "KAJA": "#FBBF24",
+                BRAND_UNASSIGNED: "#94A3B8"}
+
+# 광고비(캠페인 단위) 시트/업로드 컬럼 인식 후보
+AD_COL = {
+    "date": ["date", "날짜", "일자", "start date", "report date"],
+    "campaign": ["campaign name", "campaign", "캠페인", "캠페인명", "campaignname"],
+    "spend": ["spend", "cost", "광고비", "비용", "total spend", "ad spend", "집행액"],
+    "impressions": ["impressions", "impr", "노출수", "노출"],
+    "clicks": ["clicks", "click", "클릭수", "클릭"],
+    "orders": ["orders", "7 day total orders", "주문수", "주문", "conversions"],
+    "adsales": ["7 day total sales", "ad sales", "광고매출", "attributed sales", "sales"],
+    "brand": ["brand name", "brand", "브랜드"],
+}
+
 FBA_SUBCOLS = ["FBA_Available", "FBA_inbound_working", "FBA_inbound_shipped",
                "FBA_inbound_receiving", "FBA_reserved_orders",
                "FBA_reserved_transfer", "FBA_reserved_processing"]
@@ -328,6 +365,83 @@ def date_key(d):
     return pd.to_datetime(d).strftime("%Y-%m-%d")
 
 
+# ============================ BRAND RESOLUTION ============================
+def brand_from_internal(code):
+    """Internal Code 접두어로 브랜드 판정. 예: 'IDC-32001143' -> 'I DEW CARE'."""
+    s = re.sub(r"[^A-Za-z0-9]", "", str("" if code is None else code)).upper()
+    if not s:
+        return ""
+    for pre, brand in BRAND_PREFIX:
+        if s.startswith(pre):
+            return brand
+    return ""
+
+
+def brand_from_text(txt):
+    """브랜드명 / 제품명 / 캠페인명 등 자유 텍스트에서 브랜드 추정.
+
+    ①문자열 시작  ②구분자로 쪼갠 토큰 정확 일치 (예: 'SP_IDC_Auto')
+    ③5자 이상 별칭의 부분 일치.
+    'IDC' 같은 짧은 약자는 토큰이 정확히 일치할 때만 인정한다 —
+    'Shimmer'가 'IMM'에 걸리는 식의 오탐을 막기 위함.
+    """
+    s = str("" if txt is None else txt)
+    n = re.sub(r"[^a-z0-9]", "", s.lower())
+    if not n:
+        return ""
+    for brand, aliases in BRAND_ALIASES.items():
+        for a in aliases:
+            if n.startswith(a):
+                return brand
+    tokens = [t for t in re.split(r"[^A-Za-z0-9]+", s.lower()) if t]
+    cand = set(tokens)
+    for i in range(len(tokens)):  # 붙여 읽어야 하는 'i dew care' 대응
+        for j in (2, 3):
+            if i + j <= len(tokens):
+                cand.add("".join(tokens[i:i + j]))
+    for brand, aliases in BRAND_ALIASES.items():
+        for a in aliases:
+            if a in cand:
+                return brand
+    for brand, aliases in BRAND_ALIASES.items():
+        for a in aliases:
+            if len(a) >= 5 and a in n:
+                return brand
+    return ""
+
+
+def resolve_brand(internal="", brand_raw="", product_name="", sku=""):
+    """판정 우선순위: ①Internal Code 접두어 ②Brand Name 컬럼 ③제품명 ④SKU."""
+    for fn, val in ((brand_from_internal, internal), (brand_from_text, brand_raw),
+                    (brand_from_text, product_name), (brand_from_internal, sku)):
+        b = fn(val)
+        if b:
+            return b
+    return BRAND_UNASSIGNED
+
+
+def brand_source(internal="", brand_raw="", product_name="", sku=""):
+    """어떤 근거로 브랜드가 정해졌는지 (Settings 검증용)."""
+    if brand_from_internal(internal):
+        return "Internal Code"
+    if brand_from_text(brand_raw):
+        return "Brand Name 컬럼"
+    if brand_from_text(product_name):
+        return "제품명 추정"
+    if brand_from_internal(sku):
+        return "SKU 추정"
+    return "판정 실패"
+
+
+def brand_options(master):
+    """사이드바/페이지에서 쓸 브랜드 목록 — 항상 4개 고정, 미분류는 있을 때만."""
+    present = set(master["Brand"].tolist()) if (master is not None and "Brand" in master.columns) else set()
+    out = [b for b in BRANDS if b in present] or list(BRANDS)
+    if BRAND_UNASSIGNED in present:
+        out = out + [BRAND_UNASSIGNED]
+    return out
+
+
 # ============================ MASTER ============================
 @st.cache_data(show_spinner=False)
 def load_master_from_csv(csv_text):
@@ -339,6 +453,12 @@ def _master_from_df(df):
     ks, kn = pick(df, COL["sku"]), pick(df, COL["name"])
     ka, kb, kp = pick(df, COL["asin"]), pick(df, COL["brand"]), pick(df, COL["price"])
     kic = pick(df, COL["internal"])
+    # PRODUCT INFO 탭의 Internal Code는 F열. 헤더명으로 못 찾으면 F열(index 5)을 사용.
+    if not kic and len(df.columns) >= 6:
+        cand = list(df.columns)[5]
+        hits = sum(1 for v in df[cand].tolist() if brand_from_internal(v))
+        if hits >= max(1, int(len(df) * 0.3)):
+            kic = cand
     rows = []
     for _, r in df.iterrows():
         if not ks:
@@ -347,12 +467,19 @@ def _master_from_df(df):
         if not raw or raw.lower() == "nan":
             continue
         sku = clean_sku(raw)
+        internal = str(r[kic]).strip() if kic else ""
+        if internal.lower() == "nan":
+            internal = ""
+        brand_raw = str(r[kb]).strip() if kb else ""
+        name = str(r[kn]).strip() if kn else sku
         rows.append({
             "SKU": sku,
-            "Internal Code": str(r[kic]).strip() if kic else "",
+            "Internal Code": internal,
             "ASIN": str(r[ka]).strip() if ka else "",
-            "Product Name": str(r[kn]).strip() if kn else sku,
-            "Brand": str(r[kb]).strip() if kb else "",
+            "Product Name": name,
+            "Brand": resolve_brand(internal, brand_raw, name, sku),
+            "Brand Raw": brand_raw,
+            "Brand Source": brand_source(internal, brand_raw, name, sku),
             "price": numv(r[kp]) if kp else 0.0,
         })
     m = pd.DataFrame(rows).drop_duplicates(subset=["SKU"], keep="first")
@@ -393,7 +520,8 @@ def _values_to_df(values):
 def read_sheet(sheet_id, _auth_key):
     out = {"configured": False, "error": None,
            "cconma": pd.DataFrame(), "fba": pd.DataFrame(),
-           "sales": pd.DataFrame(), "master": pd.DataFrame(), "detected": {}}
+           "sales": pd.DataFrame(), "master": pd.DataFrame(),
+           "ads": pd.DataFrame(), "detected": {}}
     if not sheet_id:
         out["error"] = "GOOGLE_SHEET_ID 미설정"
         return out
@@ -427,6 +555,9 @@ def read_sheet(sheet_id, _auth_key):
                 role["sales"] = t
             elif "master" not in role and (has(t, "productinfo") or has(t, "master") or has(t, "마스터")):
                 role["master"] = t
+            elif "ads" not in role and (has(t, "광고") or has(t, "campaign") or has(t, "advertis")
+                                        or norm(t) in ("ad", "ads", "adspend")):
+                role["ads"] = t
         out["detected"] = role
         if role:
             resp = svc.spreadsheets().values().batchGet(
@@ -539,6 +670,45 @@ def resolve(idx, internal, sku, asin, default):
     if asin and asin in idx.get("by_asin", {}):
         return idx["by_asin"][asin], "ASIN"
     return default, None
+
+
+def index_ads(df):
+    """캠페인 단위 광고비 -> 정규화된 DataFrame.
+
+    컬럼: Date / Campaign / Brand / Spend / Impressions / Clicks / Orders / Ad Sales
+    브랜드는 ①Brand 컬럼 ②캠페인명 안의 브랜드 키워드 순으로 판정한다.
+    """
+    empty = pd.DataFrame(columns=["Date", "Campaign", "Brand", "Spend",
+                                  "Impressions", "Clicks", "Orders", "Ad Sales"])
+    if df is None or df.empty:
+        return empty
+    kd, kc = pick(df, AD_COL["date"]), pick(df, AD_COL["campaign"])
+    ksp = pick(df, AD_COL["spend"])
+    ki, kcl = pick(df, AD_COL["impressions"]), pick(df, AD_COL["clicks"])
+    ko, kas = pick(df, AD_COL["orders"]), pick(df, AD_COL["adsales"])
+    kb = pick(df, AD_COL["brand"])
+    if not ksp:
+        return empty
+    rows = []
+    for _, r in df.iterrows():
+        camp = str(r[kc]).strip() if kc else ""
+        brand_raw = str(r[kb]).strip() if kb else ""
+        brand = brand_from_text(brand_raw) or brand_from_text(camp) or BRAND_UNASSIGNED
+        try:
+            dt = pd.to_datetime(r[kd]) if kd else pd.NaT
+        except Exception:  # noqa: BLE001
+            dt = pd.NaT
+        rows.append({
+            "Date": dt.strftime("%Y-%m-%d") if dt is not pd.NaT and not pd.isna(dt) else "",
+            "Campaign": camp, "Brand": brand,
+            "Spend": numv(r[ksp]),
+            "Impressions": numv(r[ki]) if ki else 0.0,
+            "Clicks": numv(r[kcl]) if kcl else 0.0,
+            "Orders": numv(r[ko]) if ko else 0.0,
+            "Ad Sales": numv(r[kas]) if kas else 0.0,
+        })
+    out = pd.DataFrame(rows)
+    return out if not out.empty else empty
 
 
 def index_sales(df):
@@ -783,6 +953,92 @@ def brand_revenue(master, sales):
     return df
 
 
+# ============================ BRAND AGGREGATION ============================
+def _sales_totals(sales, skus):
+    """(units, revenue) — daily가 없으면 s30 집계값으로 대체."""
+    units = rev = 0.0
+    for s in skus:
+        o = sales.get(s)
+        if not o:
+            continue
+        daily = o.get("daily", {})
+        if daily:
+            for c in daily.values():
+                units += c["u"]
+                rev += c["rev"]
+        else:
+            units += o.get("s30", 0.0)
+    return units, rev
+
+
+def brand_daily(master, sales):
+    """브랜드 × 날짜 매출/판매량 시계열."""
+    bmap = {r["SKU"]: r["Brand"] for _, r in master.iterrows()}
+    acc = {}
+    for sku, o in sales.items():
+        b = bmap.get(sku, BRAND_UNASSIGNED)
+        for dk, cell in o.get("daily", {}).items():
+            k = (dk, b)
+            d = acc.setdefault(k, {"units": 0.0, "revenue": 0.0})
+            d["units"] += cell["u"]
+            d["revenue"] += cell["rev"]
+    rows = [{"date": dk, "Brand": b, "units": v["units"], "revenue": v["revenue"]}
+            for (dk, b), v in sorted(acc.items())]
+    return pd.DataFrame(rows)
+
+
+def ads_by_brand(ads):
+    """브랜드별 광고 지표 합계."""
+    cols = ["Brand", "Spend", "Impressions", "Clicks", "Orders", "Ad Sales", "Campaigns"]
+    if ads is None or ads.empty:
+        return pd.DataFrame(columns=cols)
+    g = ads.groupby("Brand", dropna=False).agg(
+        Spend=("Spend", "sum"), Impressions=("Impressions", "sum"),
+        Clicks=("Clicks", "sum"), Orders=("Orders", "sum"),
+        **{"Ad Sales": ("Ad Sales", "sum")},
+        Campaigns=("Campaign", "nunique")).reset_index()
+    return g[cols]
+
+
+def brand_rollup(master, amazon, tiktok, asales, tsales, ads):
+    """브랜드 단위 통합 성과표 — 매출 · 판매량 · 광고비 · 재고."""
+    bmap = {}
+    for _, r in master.iterrows():
+        bmap.setdefault(r["Brand"], []).append(r["SKU"])
+    adf = ads_by_brand(ads).set_index("Brand") if (ads is not None and not ads.empty) else None
+
+    rows = []
+    for b in brand_options(master):
+        skus = bmap.get(b, [])
+        a_u, a_rev = _sales_totals(asales, skus)
+        t_u, t_rev = _sales_totals(tsales, skus)
+        amz_b = amazon[amazon["Brand"] == b] if (amazon is not None and not amazon.empty) else pd.DataFrame()
+        tt_b = tiktok[tiktok["Brand"] == b] if (tiktok is not None and not tiktok.empty) else pd.DataFrame()
+        spend = float(adf.loc[b, "Spend"]) if (adf is not None and b in adf.index) else 0.0
+        ad_sales = float(adf.loc[b, "Ad Sales"]) if (adf is not None and b in adf.index) else 0.0
+        total_rev = a_rev + t_rev
+        rows.append({
+            "Brand": b,
+            "SKU 수": len(skus),
+            "Amazon 판매량 (30D)": ifloor(a_u),
+            "Amazon 매출 (30D)": round(a_rev),
+            "TikTok 판매량 (30D)": ifloor(t_u),
+            "TikTok 매출 (30D)": round(t_rev),
+            "총 매출 (30D)": round(total_rev),
+            "광고비 (30D)": round(spend),
+            "광고매출 (30D)": round(ad_sales),
+            "ACOS": round(spend / ad_sales * 100, 1) if ad_sales else None,
+            "광고비 비중": round(spend / total_rev * 100, 1) if total_rev else None,
+            "총 재고": ifloor(amz_b["Total Inventory"].sum()) if "Total Inventory" in amz_b.columns else 0,
+            "Critical SKU": int((amz_b["Status"] == "Critical").sum()) if "Status" in amz_b.columns else 0,
+            "TikTok 재고": ifloor(tt_b["Total"].sum()) if "Total" in tt_b.columns else 0,
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("총 매출 (30D)", ascending=False).reset_index(drop=True)
+    return df
+
+
 def keyword_revenue(master, sales, brand_kw, name_kw):
     """Sum 30D revenue for SKUs whose brand+name match the keywords."""
     total = 0.0
@@ -838,11 +1094,24 @@ def get_state():
     tfbt_map = index_inv(up_fbt) if up_fbt is not None else (demo["tfbt"] if demo else {})
     tsales = index_sales(up_tsales) if up_tsales is not None else (demo["tsales"] if demo else {})
 
+    # ---- 광고비(캠페인 단위): 업로드 우선, 없으면 시트의 광고 탭 ----
+    up_ads = st.session_state.get("up_ads")
+    if up_ads is not None:
+        ads = index_ads(up_ads)
+        ads_src = "업로드"
+    elif not sheet["ads"].empty:
+        ads = index_ads(sheet["ads"])
+        ads_src = f"Google Sheet ({sheet.get('detected', {}).get('ads', '광고 탭')})"
+    else:
+        ads = index_ads(pd.DataFrame())
+        ads_src = "없음"
+
     amazon, tiktok, po, tr = build_dataframes(master, cc_idx, fba_idx, asales, tfbt_map, tsales)
     validation = compute_validation(master, cc_idx, sheet)
     return {"sheet": sheet, "master": master, "amazon": amazon, "tiktok": tiktok,
             "po": po, "tr": tr, "asales": asales, "tsales": tsales,
-            "cc_idx": cc_idx, "fba_idx": fba_idx, "validation": validation}
+            "cc_idx": cc_idx, "fba_idx": fba_idx, "validation": validation,
+            "ads": ads, "ads_src": ads_src}
 
 
 def compute_validation(master, cc_idx, sheet):
@@ -875,7 +1144,7 @@ def compute_validation(master, cc_idx, sheet):
             "failed_rows": pd.DataFrame(failed_rows), "cc_total": ifloor(cc_idx.get("total_qty", 0))}
 
 
-def apply_filters(df, brand, query, use_status=False):
+def apply_filters(df, brand, query, use_status=False, fs="전체", fc="전체"):
     if df is None or df.empty:
         return df
     out = df
@@ -889,8 +1158,6 @@ def apply_filters(df, brand, query, use_status=False):
             mask = mask | out[c].astype(str).str.lower().str.contains(q, na=False)
         out = out[mask]
     if use_status:
-        fs = st.session_state.get("f_status", "전체")
-        fc = st.session_state.get("f_cov", "전체")
         if fs != "전체" and "Status" in out.columns:
             out = out[out["Status"] == fs]
         if fc != "전체" and "CoverageDays" in out.columns:
@@ -965,7 +1232,8 @@ def page_home(S, brand):
     st.divider()
     st.subheader("메뉴")
     cols = st.columns(3)
-    menus = [("📦 Amazon Inventory", "Amazon Inventory"), ("📋 Inventory Planning", "Inventory Planning"),
+    menus = [("🏷 Brand", "Brand"), ("📦 Amazon Inventory", "Amazon Inventory"),
+             ("📋 Inventory Planning", "Inventory Planning"),
              ("🎵 TikTok Inventory", "TikTok Inventory"), ("📈 Sales", "Sales")]
     for i, (label, target) in enumerate(menus):
         with cols[i % 3]:
@@ -992,11 +1260,10 @@ def page_amazon_inventory(S, brand):
     k6.metric("Total Inventory", fmt(col_sum("Total Inventory")))
 
     f1, f2 = st.columns(2)
-    st.session_state["f_status"] = f1.selectbox("Status", ["전체", "Critical", "Warning", "Healthy"],
-                                                index=["전체", "Critical", "Warning", "Healthy"].index(st.session_state.get("f_status", "전체")))
-    st.session_state["f_cov"] = f2.selectbox("Coverage", ["전체", "< 30일", "30–60일", "> 60일"],
-                                             index=["전체", "< 30일", "30–60일", "> 60일"].index(st.session_state.get("f_cov", "전체")))
-    df = apply_filters(S["amazon"], brand, st.session_state.get("query", ""), use_status=True)
+    fs = f1.selectbox("Status", ["전체", "Critical", "Warning", "Healthy"], key="amz_status")
+    fc = f2.selectbox("Coverage", ["전체", "< 30일", "30–60일", "> 60일"], key="amz_cov")
+    df = apply_filters(S["amazon"], brand, st.session_state.get("query", ""),
+                       use_status=True, fs=fs, fc=fc)
     st.caption(f"{len(df)} / {len(S['amazon'])} SKU")
     cols_order = ["Brand", "Internal Code", "SKU", "ASIN", "Product Name", "CCONMA Inventory",
                   "FBA Available", "FBA Inbound", "FBA Reserved",
@@ -1043,11 +1310,10 @@ def page_tiktok_inventory(S, brand):
     st.title("TikTok Inventory")
     st.caption("CCONMA(재고 시트_CCONMA 자동 연동) + FBT(업로드)")
     f1, f2 = st.columns(2)
-    st.session_state["f_status"] = f1.selectbox("Status", ["전체", "Critical", "Warning", "Healthy"],
-                                                index=["전체", "Critical", "Warning", "Healthy"].index(st.session_state.get("f_status", "전체")), key="tt_status")
-    st.session_state["f_cov"] = f2.selectbox("Coverage", ["전체", "< 30일", "30–60일", "> 60일"],
-                                             index=["전체", "< 30일", "30–60일", "> 60일"].index(st.session_state.get("f_cov", "전체")), key="tt_cov")
-    df = apply_filters(S["tiktok"], brand, st.session_state.get("query", ""), use_status=True)
+    fs = f1.selectbox("Status", ["전체", "Critical", "Warning", "Healthy"], key="tt_status")
+    fc = f2.selectbox("Coverage", ["전체", "< 30일", "30–60일", "> 60일"], key="tt_cov")
+    df = apply_filters(S["tiktok"], brand, st.session_state.get("query", ""),
+                       use_status=True, fs=fs, fc=fc)
     st.caption(f"{len(df)} / {len(S['tiktok'])} SKU")
     if not df.empty:
         st.dataframe(style_status(df), use_container_width=True, height=520)
@@ -1073,6 +1339,128 @@ def kpi_row(agg):
     u2.metric("7일 판매량", fmt(agg["u_7"]))
     u3.metric("30일 판매량", fmt(agg["u_30"]))
     u4.metric("일 평균(30d)", fmt(agg["u_30"] / 30))
+
+
+def page_brand(S, brand):
+    st.title("Brand Performance")
+    st.caption("Internal Code 접두어 기준 브랜드 귀속 · 매출 · 판매량 · 광고비")
+
+    master = S["master"]
+    ads = S["ads"]
+    roll = brand_rollup(master, S["amazon"], S["tiktok"], S["asales"], S["tsales"], ads)
+    if roll.empty:
+        st.info("브랜드 데이터가 없습니다.")
+        return
+
+    view = roll[roll["Brand"] == brand] if brand else roll
+
+    # ---- 브랜드 카드 ----
+    cards = view.head(5)
+    cols = st.columns(len(cards)) if len(cards) else [st]
+    for col, (_, r) in zip(cols, cards.iterrows()):
+        with col:
+            st.markdown(f"**{r['Brand']}**")
+            st.metric("총 매출 (30D)", usd(r["총 매출 (30D)"]), f"{fmt(r['SKU 수'])} SKU")
+            st.caption(f"판매량 {fmt(r['Amazon 판매량 (30D)'] + r['TikTok 판매량 (30D)'])} · "
+                       f"광고비 {usd(r['광고비 (30D)'])}")
+
+    st.divider()
+    st.subheader("브랜드별 통합 성과")
+    show = view.copy()
+    for c in ["Amazon 매출 (30D)", "TikTok 매출 (30D)", "총 매출 (30D)", "광고비 (30D)", "광고매출 (30D)"]:
+        show[c] = show[c].apply(usd)
+    for c in ["ACOS", "광고비 비중"]:
+        show[c] = show[c].apply(lambda v: f"{v}%" if v is not None and v == v else "-")
+    st.dataframe(show, use_container_width=True)
+    download_btn(roll, "⬇ 브랜드 성과 CSV", "brand_performance.csv")
+
+    # ---- 매출 / 판매량 비교 ----
+    st.divider()
+    c1, c2 = st.columns(2)
+    with c1:
+        bar = view[["Brand", "Amazon 매출 (30D)", "TikTok 매출 (30D)"]].melt(
+            id_vars="Brand", var_name="채널", value_name="매출")
+        fig = px.bar(bar, x="Brand", y="매출", color="채널", barmode="group",
+                     title="브랜드별 채널 매출 · 30d",
+                     color_discrete_sequence=[COLORS["amz"], COLORS["tt"]])
+        fig.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10),
+                          paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        bd = brand_daily(master, S["asales"])
+        if brand and not bd.empty:
+            bd = bd[bd["Brand"] == brand]
+        if bd.empty:
+            st.info("일별 데이터 없음")
+        else:
+            fig = px.line(bd, x="date", y="revenue", color="Brand",
+                          title="브랜드별 일별 매출 추이 · 30d",
+                          color_discrete_map=BRAND_COLORS)
+            fig.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10),
+                              paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig, use_container_width=True)
+
+    # ---- 광고비 ----
+    st.divider()
+    st.subheader("광고비 (캠페인 단위)")
+    st.caption(f"데이터 소스: {S['ads_src']} · 캠페인명에 브랜드 키워드가 있으면 자동으로 브랜드에 귀속됩니다")
+    if ads is None or ads.empty:
+        st.info("광고비 데이터가 아직 없습니다. 사이드바에서 CSV/XLSX를 올리거나, "
+                "연동된 구글 시트에 '광고' 또는 'Campaign'이 들어간 탭을 추가하면 자동으로 읽습니다.")
+        with st.expander("필요한 컬럼 양식 보기"):
+            st.markdown(
+                "| 컬럼 | 필수 | 인식되는 이름 |\n|---|---|---|\n"
+                "| 날짜 | 권장 | Date · 날짜 · 일자 |\n"
+                "| 캠페인명 | **필수** | Campaign Name · Campaign · 캠페인 |\n"
+                "| 광고비 | **필수** | Spend · Cost · 광고비 · 비용 |\n"
+                "| 노출수 | 선택 | Impressions · 노출수 |\n"
+                "| 클릭수 | 선택 | Clicks · 클릭수 |\n"
+                "| 주문수 | 선택 | Orders · 주문수 |\n"
+                "| 광고매출 | 선택 | 7 Day Total Sales · 광고매출 |\n\n"
+                "캠페인명 안에 `NOONI` · `IDC` / `I DEW CARE` · `IMM` / `I'M MEME` · `KAJA` 중 "
+                "하나가 들어 있으면 해당 브랜드로 자동 집계됩니다. "
+                "Brand 컬럼이 따로 있으면 그 값을 우선합니다.")
+    else:
+        ab = ads_by_brand(ads)
+        if brand:
+            ab = ab[ab["Brand"] == brand]
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("총 광고비", usd(ab["Spend"].sum()))
+        m2.metric("광고매출", usd(ab["Ad Sales"].sum()))
+        tot_spend, tot_as = ab["Spend"].sum(), ab["Ad Sales"].sum()
+        m3.metric("ACOS", f"{tot_spend / tot_as * 100:.1f}%" if tot_as else "-")
+        m4.metric("캠페인 수", fmt(ab["Campaigns"].sum()))
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            hbar(ab.sort_values("Spend", ascending=False), "Spend", "Brand",
+                 "브랜드별 광고비", COLORS["accent"])
+        with cc2:
+            camp = ads.groupby(["Campaign", "Brand"], dropna=False)["Spend"].sum().reset_index()
+            if brand:
+                camp = camp[camp["Brand"] == brand]
+            camp = camp.sort_values("Spend", ascending=False).head(10)
+            hbar(camp, "Spend", "Campaign", "캠페인 광고비 Top 10", COLORS["amz"])
+        st.markdown("##### 캠페인 상세")
+        st.dataframe(ads.sort_values("Spend", ascending=False), use_container_width=True, height=320)
+        download_btn(ads, "⬇ 광고비 CSV", "ad_spend.csv")
+
+    # ---- 브랜드 내 SKU ----
+    st.divider()
+    st.subheader("브랜드 내 SKU 매출 Top 10")
+    t1, t2 = st.tabs(["Amazon", "TikTok Shop"])
+    with t1:
+        hbar(sku_revenue_table(master, S["asales"], brand).head(10),
+             "30D Revenue", "Product Name", "Amazon · 30d", COLORS["amz"])
+    with t2:
+        hbar(sku_revenue_table(master, S["tsales"], brand).head(10),
+             "30D Revenue", "Product Name", "TikTok Shop · 30d", COLORS["tt"])
+
+    # ---- 미분류 경고 ----
+    unassigned = master[master["Brand"] == BRAND_UNASSIGNED] if "Brand" in master.columns else pd.DataFrame()
+    if not unassigned.empty:
+        st.divider()
+        st.warning(f"브랜드 판정 실패 {len(unassigned)} SKU — Internal Code 접두어를 확인하세요. "
+                   "상세는 Settings 페이지에 있습니다.")
 
 
 def page_settings(S, brand):
@@ -1123,12 +1511,45 @@ def page_settings(S, brand):
     else:
         st.success("매칭 실패 행 없음 (또는 데모 모드)")
 
+    # ---- 브랜드 매핑 검증 ----
+    st.divider()
+    st.subheader("브랜드 매핑 검증")
+    st.caption("PRODUCT INFO F열 Internal Code 접두어 기준 · NOONI / IDC / IMM / KAJA")
+    master = S["master"]
+    if "Brand" in master.columns:
+        cnt = master.groupby(["Brand", "Brand Source"]).size().reset_index(name="SKU 수")
+        b1, b2 = st.columns([1, 1])
+        with b1:
+            st.markdown("**브랜드별 SKU 수**")
+            st.dataframe(master.groupby("Brand").size().reset_index(name="SKU 수"),
+                         use_container_width=True, hide_index=True)
+        with b2:
+            st.markdown("**판정 근거별 분포**")
+            st.dataframe(cnt, use_container_width=True, hide_index=True)
+
+        un = master[master["Brand"] == BRAND_UNASSIGNED]
+        st.markdown("**브랜드 판정 실패 SKU**")
+        if un.empty:
+            st.success("모든 SKU가 4개 브랜드에 귀속되었습니다")
+        else:
+            show = un[["SKU", "Internal Code", "Brand Raw", "Product Name"]]
+            st.dataframe(show, use_container_width=True, height=280)
+            download_btn(show, "⬇ 미분류 SKU CSV", "brand_unassigned.csv")
+
+        weak = master[master["Brand Source"].isin(["제품명 추정", "SKU 추정"])]
+        if not weak.empty:
+            with st.expander(f"Internal Code 없이 추정으로 판정된 SKU {len(weak)}건"):
+                st.dataframe(weak[["SKU", "Internal Code", "Brand", "Brand Source", "Product Name"]],
+                             use_container_width=True, height=240)
+
     st.divider()
     st.subheader("연동 가이드")
     st.markdown(
         "- 환경변수: `GOOGLE_SHEET_ID`, `GOOGLE_SERVICE_ACCOUNT_JSON`(원문/base64) 또는 `GOOGLE_API_KEY`\n"
         "- CCONMA 컬럼 인식: ①이름 'CCONMA' ②이름에 'CCONMA' 포함 ③M열\n"
-        "- 매칭 우선순위: ①Internal Code ②SKU(SAP CODE) ③ASIN")
+        "- 재고 매칭 우선순위: ①Internal Code ②SKU(SAP CODE) ③ASIN\n"
+        "- 브랜드 판정 우선순위: ①Internal Code 접두어 ②Brand Name 컬럼 ③제품명 ④SKU\n"
+        "- 광고비 탭 인식: 시트명에 '광고' · 'Campaign' · 'Advertising' 포함")
 
 
 def page_sales(S, brand):
@@ -1195,7 +1616,8 @@ def main():
     with st.sidebar:
         st.markdown("### 📦 재고 관제")
         st.caption("Inventory Control")
-        menu_items = ["Home", "Amazon Inventory", "Inventory Planning", "TikTok Inventory", "Sales", "Settings"]
+        menu_items = ["Home", "Brand", "Amazon Inventory", "Inventory Planning",
+                      "TikTok Inventory", "Sales", "Settings"]
         st.session_state["menu"] = st.radio("메뉴", menu_items,
                                             index=menu_items.index(st.session_state.get("menu", "Home")))
         st.divider()
@@ -1204,7 +1626,7 @@ def main():
     S = get_state()
 
     with st.sidebar:
-        brands = sorted([b for b in S["master"]["Brand"].unique().tolist() if b])
+        brands = brand_options(S["master"])
         brand = st.selectbox("Brand Filter", ["All Brands"] + brands)
         brand = "" if brand == "All Brands" else brand
         st.session_state["query"] = st.text_input("검색 (SKU · ASIN · 제품명)", st.session_state.get("query", ""))
@@ -1215,6 +1637,8 @@ def main():
                          on_change=lambda: st.session_state.update(up_fbt=_read_upload(st.session_state.get("_fbt_file"))))
         st.file_uploader("TikTok 판매량 (CSV/XLSX)", type=["csv", "xlsx", "xls"], key="_tsales_file",
                          on_change=lambda: st.session_state.update(up_tsales=_read_upload(st.session_state.get("_tsales_file"))))
+        st.file_uploader("광고비 · 캠페인별 (CSV/XLSX)", type=["csv", "xlsx", "xls"], key="_ads_file",
+                         on_change=lambda: st.session_state.update(up_ads=_read_upload(st.session_state.get("_ads_file"))))
         st.divider()
         sheet = S["sheet"]
         if sheet["configured"]:
@@ -1228,6 +1652,8 @@ def main():
     menu = st.session_state["menu"]
     if menu == "Home":
         page_home(S, brand)
+    elif menu == "Brand":
+        page_brand(S, brand)
     elif menu == "Amazon Inventory":
         page_amazon_inventory(S, brand)
     elif menu == "Inventory Planning":
